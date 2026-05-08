@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+    volumes:
+      - ./db:/app/db
+      - ./logs:/app/logs
+    command: python -m api.app
+    restart: unless-stopped
+
+  ui:
+    build: .
+    ports:
+      - "8501:8501"
+    environment:
+      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+    volumes:
+      - ./db:/app/db
+      - ./logs:/app/logs
+    command: streamlit run main.py --server.port 8501 --server.address 0.0.0.0
+    depends_on:
+      - api
+    restart: unless-stopped

@@ -1,0 +1,6 @@
+# JD-Agent 配置文件
+
+external_data_path: data/external/records.csv
+max_iterations: 10
+enable_task_planner: true
+enable_long_term_memory: true
