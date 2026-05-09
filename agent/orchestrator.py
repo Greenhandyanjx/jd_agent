@@ -1,100 +1,176 @@
 """
 Agent Orchestrator: Agent 编排器
-作为系统的统一入口，管理 ReAct Loop + Memory + Task Planner + Tool System
+参考 nanobot 的 bus/queue.py + agent/loop.py 设计
+
+编排器是系统的统一入口：
+1. 初始化 MessageBus + AgentLoop + Provider + Tools
+2. 提供 chat() / chat_stream() 接口给外部调用
+3. 管理 Agent 生命周期
+
+核心改变（参考 nanobot 后）：
+- 使用 MessageBus 解耦输入/输出
+- AgentLoop 处理所有消息
+- Provider 抽象化，支持切换
+- 新的三层记忆系统
 """
-from typing import Optional, Generator
-from utils.logger import logger
-from agent.core.react_loop import ReactLoop
-from agent.core.tool_registry import get_all_tools
-from agent.memory.short_term import ShortTermMemory
-from agent.memory.working_memory import WorkingMemory
-from agent.memory.long_term import LongTermMemory
-from agent.planner.task_planner import TaskPlanner
-from agent.planner.task_graph import TaskExecutor
+
+import asyncio
+from pathlib import Path
+from typing import AsyncGenerator, Generator
+
+from loguru import logger
+
+from agent.core.types import InboundMessage, OutboundMessage
+from agent.core.llm_provider import LLMProvider
+from agent.bus.queue import MessageBus
+from agent.loop import AgentLoop
+from agent.tools.registry import ToolRegistry
 
 
 class AgentOrchestrator:
     """
-    Agent 编排器
-    统一调度 Agent 各模块
+    Agent 编排器。
+    
+    负责：
+    1. 初始化所有组件（总线、循环、Provider、工具）
+    2. 提供同步/异步的 chat() 接口
+    3. 管理工具注册
     """
 
-    def __init__(self):
-        self.react_loop = ReactLoop()
-        self.short_term_memory = self.react_loop.short_term_memory
-        self.working_memory = self.react_loop.working_memory
-        self.long_term_memory = LongTermMemory()
-        self.task_planner = TaskPlanner(self.working_memory)
-        self.task_executor = TaskExecutor(self.task_planner, self.react_loop)
+    _instance = None
+
+    def __init__(self, provider: LLMProvider | None = None, workspace: str | None = None):
+        self.bus = MessageBus()
+        self.provider = provider
+        self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
+        self.loop: AgentLoop | None = None
+        self._task: asyncio.Task | None = None
+
+    # ─── 初始化 ────────────────────────────────
+
+    async def initialize(self) -> None:
+        """
+        初始化 Agent 系统。
+        
+        必须先调用此方法才能使用 Agent。
+        """
+        self.loop = AgentLoop(
+            bus=self.bus,
+            provider=self.provider,
+            workspace=self.workspace,
+        )
+        # 启动消息处理循环（后台任务）
+        self._task = asyncio.create_task(self.loop.run())
+        logger.info("[Orchestrator] Agent 初始化完成")
+
+    # ─── 同步接口 ──────────────────────────────
 
     def chat(self, user_query: str) -> str:
         """
-        处理用户消息
-        自动判断是简单问答还是复杂任务
+        同步聊天接口。
+        
+        适用于 CLI、Streamlit 等简单调用场景。
+        内部实际走异步路径。
         """
-        logger.info(f"[AgentOrchestrator] 收到用户消息: {user_query[:50]}...")
+        return asyncio.run(self.chat_async(user_query))
 
-        # 检查是否有相关长期记忆
-        memories = self.long_term_memory.recall(user_query)
-        if memories:
-            context = "\n".join([m["content"] for m in memories])
-            enriched_query = f"{user_query}\n\n[相关历史记忆]:\n{context}"
-        else:
-            enriched_query = user_query
-
-        # 判断任务复杂度（简单 vs 复杂）
-        if self._is_complex_task(enriched_query):
-            logger.info("[AgentOrchestrator] 识别为复杂任务，启动 Task Planner")
-            return self.task_executor.execute_plan(enriched_query)
-        else:
-            logger.info("[AgentOrchestrator] 简单任务，直接走 ReAct")
-            return self.react_loop.execute(enriched_query)
-
-    def chat_stream(self, user_query: str) -> Generator[str, None, str]:
+    async def chat_async(self, user_query: str) -> str:
         """
-        流式处理用户消息
+        异步聊天接口。
+        
+        构造消息 → 直接处理（不走队列） → 返回结果。
         """
-        logger.info(f"[AgentOrchestrator] 流式处理: {user_query[:50]}...")
+        if self.loop is None:
+            await self.initialize()
 
-        memories = self.long_term_memory.recall(user_query)
-        if memories:
-            context = "\n".join([m["content"] for m in memories])
-            enriched_query = f"{user_query}\n\n[相关历史记忆]:\n{context}"
-        else:
-            enriched_query = user_query
+        response = await self.loop.process_direct(
+            content=user_query,
+            session_key="cli:direct",
+            channel="cli",
+            chat_id="direct",
+        )
+        return response.content if response else ""
 
-        if self._is_complex_task(enriched_query):
-            yield "[检测到复杂任务，正在分解...]\n"
-            result = self.task_executor.execute_plan(enriched_query)
-            yield result
-            return result
-        else:
-            return self.react_loop.execute_stream(enriched_query)
-
-    def _is_complex_task(self, query: str) -> bool:
+    async def chat_stream_async(self, user_query: str) -> AsyncGenerator[str, None]:
         """
-        简单判断任务复杂度
-        如果涉及多个动作、分析、对比等，认为是复杂任务
+        异步流式聊天接口。
+        
+        每次 yield 一个文本块。
         """
-        complex_keywords = [
-            "分析", "对比", "比较", "整理", "总结", "报告",
-            "所有", "全部", "各个", "分别", "同时",
-            "然后", "之后", "先", "再",
-            "每月", "每周", "统计", "趋势",
-        ]
-        query_lower = query
-        keyword_count = sum(1 for kw in complex_keywords if kw in query_lower)
-        return keyword_count >= 2 or len(query) > 100
+        if self.loop is None:
+            await self.initialize()
 
-    def get_available_tools(self) -> list[dict]:
-        """获取可用工具列表"""
-        return [t.schema.to_dict() for t in get_all_tools()]
+        msg = InboundMessage(
+            channel="cli",
+            sender_id="user",
+            chat_id="direct",
+            content=user_query,
+        )
+
+        # 构造流式 progress 回调
+        stream_buffer = []
+
+        async def on_stream(delta: str) -> None:
+            stream_buffer.append(delta)
+
+        class StreamProxy:
+            """用闭包收集流式内容"""
+            pass
+
+        # 处理消息
+        response = await self.loop._process_message(msg)
+
+        if stream_buffer:
+            for chunk in stream_buffer:
+                yield chunk
+        elif response and response.content:
+            yield response.content
+
+    # ─── 工具管理 ──────────────────────────────
+
+    def get_tool_registry(self) -> ToolRegistry:
+        """获取工具注册中心（用于注册外部工具）"""
+        if self.loop:
+            return self.loop.tools
+        return None
+
+    def get_all_tools(self) -> list[dict]:
+        """获取所有已注册工具的 Schema"""
+        if self.loop:
+            return self.loop.tools.get_definitions()
+        return []
+
+    def get_tool_names(self) -> list[str]:
+        """获取所有工具名称"""
+        if self.loop:
+            return self.loop.tools.tool_names
+        return []
+
+    # ─── 会话管理 ──────────────────────────────
+
+    def clear_session(self) -> None:
+        """清空当前会话"""
+        if self.loop:
+            session = self.loop.sessions.get_or_create("cli:direct")
+            session.clear()
 
     def get_session_history(self) -> list[dict]:
         """获取当前会话历史"""
-        return self.short_term_memory.get_all()
+        if self.loop:
+            session = self.loop.sessions.get_or_create("cli:direct")
+            return session.get_history()
+        return []
 
-    def clear_session(self):
-        """清空当前会话"""
-        self.short_term_memory.clear()
-        self.working_memory.clear()
+    # ─── 生命周期 ──────────────────────────────
+
+    async def shutdown(self) -> None:
+        """关闭 Agent"""
+        if self.loop:
+            self.loop.stop()
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+        logger.info("[Orchestrator] Agent 已关闭")

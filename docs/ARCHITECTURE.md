@@ -1,423 +1,468 @@
 # JD-Agent 系统架构文档
 
-> 一个参考 OpenClaw 架构与 Claude Code 任务规划机制的大模型应用智能体框架
+> 一个参考 **nanobot**（OpenClaw 的轻量级 Python 替代品）架构的大模型应用智能体框架
+>
+> nanobot 是 OpenClaw 的"平替"——用 99% 更少的代码实现了相同的核心 Agent 功能
 
 ---
 
-## 一、整体架构概览
+## 一、设计理念
+
+### 为什么从 OpenClaw 转向 nanobot？
+
+| 对比 | OpenClaw | nanobot → JD-Agent |
+|------|----------|-------------------|
+| **语言** | TypeScript | Python |
+| **代码量** | 60+ 模块，大量重抽象 | ~10 个文件，清晰直接 |
+| **架构复杂度** | 多层抽象（gateway/plugin/harness/routing） | 总线 + 循环 + Provider 三位一体 |
+| **学习曲线** | 需要深入理解整个 gateway 插件体系 | 几小时内可读完全部代码 |
+
+### 核心理念：MessageBus 解耦一切
+
+```
+  Channel (CLI / Streamlit / API)
+        │
+        ▼  publish_inbound()
+  ┌─────────────────┐
+  │   MessageBus    │  ← 异步 asyncio.Queue
+  └─────────────────┘
+        │  consume_inbound()
+        ▼
+  ┌─────────────────┐
+  │   AgentLoop     │  ← ReAct 循环（Think→Act→Observe）
+  └─────────────────┘
+        │  publish_outbound()
+        ▼
+  ┌─────────────────┐
+  │   MessageBus    │
+  └─────────────────┘
+        │  consume_outbound()
+        ▼
+  OutboundMessage → Channel
+```
+
+关键：通道只管 publish / consume 消息，Agent 核心不关心消息来自于 Streamlit 还是 API。
+
+---
+
+## 二、整体架构概览
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                        JD-Agent System                              │
+│                        JD-Agent v2 架构                              │
 │                                                                     │
-│  ┌─────────┐  ┌──────────┐  ┌──────────┐  ┌───────────────────┐   │
-│  │  API     │  │ Streamlit │  │ WebSocket │  │ External System   │   │
-│  │  Layer   │  │  UI       │  │  Gateway  │  │ (外卖系统API)     │   │
-│  └────┬─────┘  └────┬─────┘  └────┬─────┘  └────────┬──────────┘   │
-│       │             │             │                   │              │
-│       └─────────────┼─────────────┼───────────────────┘              │
-│                     ▼             ▼                                   │
-│  ┌────────────────────────────────────────────────────────────────┐  │
-│  │                    [ Agent Router ]                            │  │
-│  │  请求路由 / 会话管理 / 认证 / 限流                            │  │
-│  └────────────────────────┬───────────────────────────────────────┘  │
-│                           │                                          │
-│  ┌────────────────────────▼───────────────────────────────────────┐  │
-│  │                    [ Agent Orchestrator ]                      │  │
-│  │  - 接收用户请求 → 判断意图 → 分发到对应的处理模块             │  │
-│  │  - 管理 Agent 生命周期与状态                                   │  │
-│  └────────────────────────────────────────────────────────────────┘  │
-│                           │                                          │
-│         ┌─────────────────┼─────────────────┐                       │
-│         ▼                 ▼                  ▼                       │
-│  ┌────────────┐  ┌──────────────┐  ┌─────────────────┐             │
-│  │ RAG Module │  │ Agent Core   │  │ Task Planner    │             │
-│  │ (检索增强)  │  │ (ReAct循环)  │  │ (任务规划)      │             │
-│  └────────────┘  └──────────────┘  └─────────────────┘             │
-│                           │                                          │
-│         ┌─────────────────┼─────────────────┐                       │
-│         ▼                 ▼                  ▼                       │
-│  ┌────────────┐  ┌──────────────┐  ┌─────────────────┐             │
-│  │ Memory     │  │ Tool System  │  │ Plugin System   │             │
-│  │ (记忆系统)  │  │ (工具系统)   │  │ (插件系统)      │             │
-│  └────────────┘  └──────────────┘  └─────────────────┘             │
-│                           │                                          │
-│  ┌────────────────────────▼───────────────────────────────────────┐  │
-│  │               [ LLM Interface / Model Factory ]               │  │
-│  │   通义千问 / DeepSeek / OpenAI — 统一调用封装                  │  │
-│  └────────────────────────────────────────────────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                      AgentOrchestrator                       │   │
+│  │  ┌────────────┐  ┌───────────┐  ┌────────────┐             │   │
+│  │  │ MessageBus │  │ AgentLoop │  │ Provider   │             │   │
+│  │  │ (异步队列)  │  │ (ReAct)    │  │ (LLM抽象)  │             │   │
+│  │  └────────────┘  └───────────┘  └────────────┘             │   │
+│  │                     │          │                            │   │
+│  │  ┌──────────────────┴──────────┴────────────────────────┐   │   │
+│  │  │                 ToolRegistry                         │   │   │
+│  │  │   register() → get_definitions() → execute()        │   │   │
+│  │  └──────────────────────┬───────────────────────────────┘   │   │
+│  │                         │                                    │   │
+│  │  ┌──────────────────────┴───────────────────────────────┐   │   │
+│  │  │              SessionManager + MemoryStore             │   │   │
+│  │  │   JSONL 持久化 · MEMORY.md · HISTORY.md · 向量检索    │   │   │
+│  │  └──────────────────────────────────────────────────────┘   │   │
+│  └──────────────────────────────────────────────────────────┘   │   │
+│                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 二、Agent Core：自实现 ReAct 循环
+## 三、Agent Core：ReAct 循环（仿 nanobot）
 
 ### 核心流程
 
 ```
-                        ┌─────────────────┐
-                        │    User Input    │
-                        └────────┬────────┘
-                                 ▼
-                        ┌─────────────────┐
-                        │   Intent Judge   │
-                        │ (意图判断)       │
-                        └────────┬────────┘
-                                 ▼
-            ┌────────────────────────────────────┐
-            │                                    │
-            ▼                                    ▼
-   ┌──────────────────┐              ┌──────────────────────┐
-   │    Simple QA     │              │  Complex Task →      │
-   │    (直接回答)     │              │  Task Planner 分解   │
-   └──────────────────┘              └──────────┬───────────┘
-                                                 ▼
-            ┌──────────────────────────────────────────────┐
-            │           ReAct Loop (最大 N 轮)             │
-            │                                              │
-            │   ┌─────────┐    ┌──────────┐    ┌────────┐ │
-            │   │  Think   │───▶│   Act     │───▶│ Observe│ │
-            │   │ (推理)    │    │ (调用工具) │    │ (观察)  │ │
-            │   └─────────┘    └──────────┘    └────────┘ │
-            │         │              │              │       │
-            │         └──────────────┴──────────────┘       │
-            │                      │                        │
-            │                      ▼                        │
-            │             信息足够？ / 到达最大轮数？        │
-            │             是 → 生成最终回复                 │
-            └──────────────────────────────────────────────┘
+                     User Input
+                         │
+                         ▼
+             ┌─────────────────────┐
+             │  ContextBuilder     │
+             │  构建 System Prompt │
+             │  + 历史 + 当前消息   │
+             └──────────┬──────────┘
+                        │
+                        ▼
+             ┌─────────────────────┐
+             │  ReAct Loop         │
+             │  (最大 N 轮)         │
+             │                     │
+    ┌────────┴────────┐            │
+    │   Call LLM      │            │
+    │  (带重试退避)    │            │
+    └────────┬────────┘            │
+             │                     │
+      ┌──────┴──────┐              │
+      ▼              ▼              │
+  ┌─────────┐  ┌──────────┐        │
+  │ Tool Call│  │Text Reply│        │
+  │ (Act)    │  │ (Final)  │──→Done│
+  └────┬────┘  └──────────┘        │
+       │                           │
+       ▼                           │
+  ┌─────────┐                      │
+  │ Execute │   ┌──────────┐       │
+  │ Tool(s) │──▶│ Observe  │──→Loop│
+  │(并发执行)│   │ (注入结果)│       │
+  └─────────┘   └──────────┘       │
+             └─────────────────────┘
 ```
 
-### 关键设计要点
+### Key Design（来自 nanobot）
 
-| 组件 | 描述 | 实现位置 |
+| 特性 | 说明 | 对应代码 |
 |------|------|---------|
-| **Think** | 模型根据当前状态（历史消息+工具返回结果）推理下一步 | `agent/core/react_loop.py` |
-| **Act** | 解析模型输出的 Function Call，调度对应工具 | `agent/core/function_calling.py` |
-| **Observe** | 收集工具执行结果，追加到消息历史 | `agent/core/react_loop.py` |
-| **Stop Condition** | 最大迭代次数（默认10轮）+ 信息充足判断 | `agent/core/react_loop.py` |
-| **Fallback** | 工具连续失败 → 切换策略 / 告知用户 | `agent/core/fallback.py` |
+| **异步** | 全程 asyncio，跨 session 可并发 | `agent/loop.py` |
+| **重试** | 指数退避 + Retry-After 解析 | `agent/core/llm_provider.py` |
+| **Streaming** | 流式输出 + tool call 累加 | `providers/*.py` |
+| **并行工具** | `asyncio.gather()` 并发执行同轮工具调用 | `agent/loop.py` |
+| **会话隔离** | per-session Lock，同 session 串行 | `agent/loop.py` |
+| **并发门控** | 全局 Semaphore 控制并发数 | `agent/loop.py` |
 
 ---
 
-## 三、Memory 层级系统
+## 四、消息总线（MessageBus）— 参考 nanobot
 
-采用 OpenClaw 的三层记忆架构：
+```
+Agent ←─────────────────────────────────────── 通道
+       │   subscribe                            │
+       ▼                                        │
+  ┌─────────────────────────┐                   │
+  │    MessageBus           │                   │
+  │                         │                   │
+  │  Inbound Queue ──────── AgentLoop           │
+  │  Outbound Queue ─────── 通道                │
+  │                         │                   │
+  └─────────────────────────┘                   │
+                                                │
+  入站: InboundMessage(channel, sender, content)
+  出站: OutboundMessage(channel, chat_id, content)
+```
+
+参考 nanobot 的 `bus/queue.py` 和 `bus/events.py`，用两个 `asyncio.Queue` 实现通道与 Agent 的解耦。
+
+---
+
+## 五、LLM Provider 抽象 — 参考 nanobot
+
+```
+                 LLMProvider (抽象基类)
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+    OpenAIProvider          TongyiProvider
+    (DeepSeek/GPT/...)      (通义千问)
+          │                       │
+    统一的 chat() / chat_stream() 接口
+          │
+          ▼
+    LLMResponse(content, tool_calls, finish_reason, usage)
+```
+
+核心设计（来自 nanobot `providers/base.py`）：
+- `chat_with_retry()` / `chat_stream_with_retry()` 自动处理重试
+- 瞬态错误自动识别（429/500/502/503/504/timeout）
+- 指数退避 + Retry-After 头部解析
+- 统一的 Tool Call 解析层
+
+---
+
+## 六、Tool 系统 — 参考 nanobot
+
+```
+                 Tool (抽象基类)
+                      │
+          ┌───────────┴───────────┐
+          ▼                       ▼
+     ReadFileTool            WebFetchTool
+     WriteFileTool           WeatherTool
+                              RAGQueryTool
+                              ...
+                      │
+                      ▼
+                ToolRegistry
+          register() → get_definitions() → execute()
+```
+
+参考 nanobot 的 `agent/tools/base.py` 和 `agent/tools/registry.py`：
+- 每个工具继承 `Tool` 基类，实现 `name` / `description` / `parameters` / `execute()`
+- `to_schema()` 转为 OpenAI Function Calling 格式
+- `register_all_tools()` 统一注册入口
+
+### 内置工具
+
+| 工具名 | 来源 | 功能 |
+|--------|------|------|
+| `read_file` | nanobot | 读取文件内容 |
+| `write_file` | nanobot | 写入/创建文件 |
+| `web_fetch` | nanobot | 抓取网页内容 |
+| `rag_query` | 原有 | RAG 检索增强查询 |
+| `get_weather` | 原有迁移 | 天气查询（Mock） |
+| `get_user_location` | 原有迁移 | 用户位置获取 |
+| `get_user_id` | 原有迁移 | 用户ID获取 |
+| `get_current_month` | 原有迁移 | 当前月份 |
+| `query_order` | 原有迁移 | 外卖订单查询 |
+| `recommend_dish` | 原有迁移 | 菜品推荐 |
+| `check_delivery_status` | 原有迁移 | 配送状态查询 |
+
+---
+
+## 七、记忆系统（三层 + LLM Consolidation）— 参考 nanobot
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Memory Layer                             │
+│                         Memory Layer                             │
 │                                                                  │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Short-Term Memory (短期记忆)                             │   │
-│  │  - 当前会话的消息历史（保留最近 N 条）                   │   │
-│  │  - 保存在内存中，会话结束可丢弃                          │   │
-│  │  - 存储位置: agent/memory/short_term.py                  │   │
+│  │  Layer 1: Session Messages (JSONL) — 短期记忆            │   │
+│  │   - sessions/{key}.jsonl（每会话一个文件）               │   │
+│  │   - 追加写，首次写入时创建，原子替换                     │   │
+│  │   - 断裂恢复：自动检测 orphan tool 消息并跳过           │   │
+│  │   - SessionManager.get_or_create() 懒加载                │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                    │
 │                              ▼                                    │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Working Memory (工作记忆)                                │   │
-│  │  - 当前任务的执行状态、中间结果、子任务进度              │   │
-│  │  - Task Planner 读写，ReAct Loop 只读                    │   │
-│  │  - 存储位置: agent/memory/working_memory.py              │   │
+│  │  Layer 2: HISTORY.md — 可 grep 搜索的行为日志            │   │
+│  │   - 由 MemoryConsolidator 自动写入                      │   │
+│  │   - 格式：[YYYY-MM-DD HH:MM] 关键事件摘要               │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                    │
 │                              ▼                                    │
 │  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Long-Term Memory (长期记忆)                              │   │
-│  │  - 跨会话持久化：用户偏好、历史行为、重要结论             │   │
-│  │  - 向量化存储（ChromaDB）+ 语义检索                      │   │
-│  │  - 存储位置: agent/memory/long_term.py                   │   │
+│  │  Layer 3: MEMORY.md — 长期事实记忆（nanobot 模式）       │   │
+│  │   - 跨会话持久：用户偏好、关键事实、重要结论             │   │
+│  │   - 通过 LLM tool call 自动写入（不是向量数据库）        │   │
+│  │   - 参考 nanobot 的 memory.py 设计                      │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                              │                                    │
+│                              ▼                                    │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  保留：ChromaDB 向量检索长期记忆（long_term.py）         │   │
+│  │   - 用于 RAG 场景的语义检索                             │   │
+│  │   - 与 nanobot 的 MEMORY.md 模式互补                    │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-## 四、Tool System 工具系统
-
-借鉴 OpenClaw Plugin 系统的注册-调度模式：
+### MemoryConsolidator（来自 nanobot 的核心创新）
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         Tool System                              │
-│                                                                   │
-│  ┌────────────────────────────────────────┐                      │
-│  │         Tool Registry (工具注册中心)     │                      │
-│  │  - register() / unregister() / list()   │                      │
-│  │  - 自动收集 @tool 装饰器标注的函数      │                      │
-│  └──────────────────┬─────────────────────┘                      │
-│                     │                                             │
-│  ┌──────────────────▼─────────────────────┐                      │
-│  │      Tool Schema Manager               │                      │
-│  │  - 为每个工具生成 JSON Schema           │                      │
-│  │  - 输入参数验证（Pydantic）             │                      │
-│  │  - 返回值验证（格式检查）               │                      │
-│  └──────────────────┬─────────────────────┘                      │
-│                     │                                             │
-│  ┌──────────────────▼─────────────────────┐                      │
-│  │      Tool Executor                      │                      │
-│  │  - 工具调用调度                         │                      │
-│  │  - 超时控制（默认30s）                  │                      │
-│  │  - 重试机制（3次 + 指数退避）           │                      │
-│  │  - 安全沙箱（限制危险操作）             │                      │
-│  └─────────────────────────────────────────┘                      │
-└──────────────────────────────────────────────────────────────────┘
+每 N 条消息 / 每 T 分钟
+        │
+        ▼
+  收集未 consolidated 的对话
+        │
+        ▼
+  调用 LLM 分析关键信息
+        │
+        ▼
+  同时写入 HISTORY.md + MEMORY.md
+        │
+        ▼
+  更新 session.last_consolidated
 ```
 
-### 内置工具列表
-
-| 工具名 | 描述 | 来源 |
-|--------|------|------|
-| `rag_query` | RAG 检索增强查询 | RAG Module |
-| `get_weather` | 天气查询（Mock） | 原有迁移 |
-| `get_user_location` | 用户位置获取 | 原有迁移 |
-| `get_user_id` | 用户ID获取 | 原有迁移 |
-| `get_current_month` | 当前月份获取 | 原有迁移 |
-| `fetch_external_data` | 外部系统数据获取 | 原有迁移 |
-| `fill_context_for_report` | 报告上下文填充 | 原有迁移 |
-| `query_order` | 外卖订单查询 | 外卖集成 |
-| `recommend_dish` | 菜品推荐 | 外卖集成 |
-| `check_delivery_status` | 配送状态查询 | 外卖集成 |
+参考 nanobot 的 `agent/memory.py`。让 LLM 自己决定应该记住什么——而不是硬编码记忆规则。
 
 ---
 
-## 五、Task Planner 任务规划
-
-借鉴 Claude Code 的 Plan-Solve 模式：
+## 八、Context Builder — 参考 nanobot
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        Task Planner                              │
-│                                                                   │
-│  用户输入: "帮我分析上个月的订单数据并推荐热门菜品"                │
-│                                                                   │
-│  ┌──────────────────────────────────────────────────────────┐   │
-│  │  Step 1: Task Decomposition                              │   │
-│  │  ┌────────────────────────────────────────────────────┐  │   │
-│  │  │  子任务1: 获取上个月的订单数据 (query_order)        │  │   │
-│  │  │  子任务2: 分析订单趋势 (analyze_data)               │  │   │
-│  │  │  子任务3: 推荐热门菜品 (recommend_dish)             │  │   │
-│  │  │  子任务4: 生成最终报告 (generate_report)             │  │   │
-│  │  └────────────────────────────────────────────────────┘  │   │
-│  └──────────────────────────────────────────────────────────┘   │
-│                              │                                    │
-│  ┌──────────────────────────▼──────────────────────────────────┐ │
-│  │  Step 2: Dependency Graph                                  │ │
-│  │  task1 → task2 → task3 → task4  (线性链)                  │ │
-│  │  task1 ──→ task2                                           │ │
-│  │    │                                                       │ │
-│  │    └──→ task3  (并行分支)                                  │ │
-│  └────────────────────────────────────────────────────────────┘ │
-│                              │                                    │
-│  ┌──────────────────────────▼──────────────────────────────────┐ │
-│  │  Step 3: Execute with State                                 │ │
-│  │  - ReAct Loop 负责执行每个子任务                            │ │
-│  │  - Working Memory 保存中间结果                              │ │
-│  │  - 子任务失败不影响其他分支（容错）                         │ │
-│  └────────────────────────────────────────────────────────────┘ │
-└──────────────────────────────────────────────────────────────────┘
+ContextBuilder
+  │
+  ├─ _get_identity()        → 核心身份 + 运行时信息
+  ├─ _load_bootstrap_content() → AGENTS.md / SOUL.md / USER.md / TOOLS.md
+  ├─ memory.get_memory_context() → MEMORY.md 长期记忆
+  │
+  └─ build_messages()       → 完整消息列表：system + 历史 + 当前
 ```
+
+参考 nanobot 的 `agent/context.py`，System Prompt 从 workspace 文件中读取。
 
 ---
 
-## 六、RAG 检索增强系统
+## 九、Session 管理 — 参考 nanobot
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         RAG System                                  │
-│                                                                      │
-│  ┌───────────────────────┐                                          │
-│  │    User Query         │                                          │
-│  └──────────┬────────────┘                                          │
-│             ▼                                                        │
-│  ┌───────────────────────┐                                          │
-│  │  Query Rewrite        │  ← 查询改写模块（优化检索命中）           │
-│  │  - 改写用户原始问题    │                                          │
-│  │  - 多角度生成查询变体  │                                          │
-│  └──────────┬────────────┘                                          │
-│             ▼                                                        │
-│  ┌───────────────────────┐                                          │
-│  │  Multi-Route Retrieval│  ← 多路召回                              │
-│  │  ┌─────────────────┐  │                                          │
-│  │  │ ① 向量检索       │  │  (ChromaDB + Embeddings)               │
-│  │  │ ② BM25关键词检索  │  │  (Whoosh/Jieba)                        │
-│  │  │ ③ 混合权重融合    │  │  (加权融合 RRF)                        │
-│  │  └─────────────────┘  │                                          │
-│  └──────────┬────────────┘                                          │
-│             ▼                                                        │
-│  ┌───────────────────────┐                                          │
-│  │  Reranker             │  ← 重排序模块                            │
-│  │  - 对检索结果精排      │                                          │
-│  │  - 交叉编码器(BERT)   │                                          │
-│  └──────────┬────────────┘                                          │
-│             ▼                                                        │
-│  ┌───────────────────────┐                                          │
-│  │  LLM Generation       │  ← 上下文 + 查询 → 生成回答              │
-│  └───────────────────────┘                                          │
-└─────────────────────────────────────────────────────────────────────┘
+SessionManager
+  │
+  ├─ get_or_create(key) → 内存缓存 / 懒加载 JSONL
+  ├─ save(session)      → 原子写（先 .tmp 再 rename）
+  └─ delete_session()   → 删除文件 + 清除缓存
+
+Session
+  ├─ key: "channel:chat_id"
+  ├─ messages: [{role, content, tool_calls, ...}]
+  ├─ last_consolidated: N  ← 记忆 consolidation 进度
+  └─ get_history() → 返回对齐到合法 tool-call 边界的消息
 ```
+
+参考 nanobot 的 `session/manager.py`。JSONL 格式的好处：
+- 追加写（高性能）
+- 每行一条独立 JSON（原子性好）
+- 不需要数据库依赖
 
 ---
 
-## 七、Middleware 中间件链
-
-借鉴 OpenClaw 的 Gateway 中间件模式：
-
-```
-请求进入 → [Auth] → [Rate Limit] → [Log] → [Context Enrich] → Agent
-                    ↑               ↑       ↑
-              身份验证       限流保护   日志记录   上下文增强
-```
-
-| 中间件 | 职责 | 状态 |
-|--------|------|------|
-| `auth_middleware` | API 鉴权 | 计划中 |
-| `rate_limit_middleware` | Token桶限流 | 计划中 |
-| `log_middleware` | 请求/响应日志 | 迁移自原有 |
-| `context_enrich_middleware` | 补充上下文信息 | 迁移自原有 |
-| `tool_monitor_middleware` | 工具调用监控 | 迁移自原有 |
-
----
-
-## 八、目录结构
+## 十、目录结构（完整版）
 
 ```
 jd_agent/
 ├── agent/
-│   ├── core/                  # Agent 核心
+│   ├── __init__.py              # 统一导出
+│   ├── loop.py                  # [新] ReAct 循环核心（仿 nanobot agent/loop.py）
+│   ├── orchestrator.py          # [改] 编排器（集成 MessageBus + AgentLoop + Provider）
+│   │
+│   ├── core/
 │   │   ├── __init__.py
-│   │   ├── react_loop.py      # ReAct 循环（自实现）
-│   │   ├── function_calling.py # Function Calling 解析
-│   │   ├── tool_registry.py   # 工具注册中心
-│   │   ├── schema_validator.py # Schema 校验
-│   │   └── fallback.py        # 错误回退策略
-│   ├── memory/                # 记忆系统
+│   │   ├── types.py             # [新] 核心数据类型（LLMResponse, ToolCallRequest, InboundMessage...）
+│   │   ├── llm_provider.py      # [新] LLM Provider 抽象基类（仿 nanobot providers/base.py）
+│   │   ├── react_loop.py        # [保留] 原有 ReAct 循环（兼容旧代码）
+│   │   ├── function_calling.py  # [保留] Function Call 解析器
+│   │   ├── tool_registry.py     # [保留] 装饰器式工具注册（旧接口）
+│   │   ├── schema_validator.py  # [保留] 参数校验器
+│   │   └── fallback.py          # [保留] 错误回退策略
+│   │
+│   ├── bus/
+│   │   ├── __init__.py          # [新]
+│   │   └── queue.py             # [新] 消息总线（仿 nanobot bus/queue.py）
+│   │
+│   ├── providers/
+│   │   ├── __init__.py          # [新]
+│   │   ├── openai_provider.py   # [新] OpenAI/DeepSeek Provider
+│   │   └── tongyi_provider.py   # [新] 通义千问 Provider
+│   │
+│   ├── tools/
 │   │   ├── __init__.py
-│   │   ├── short_term.py      # 短期记忆（会话上下文）
-│   │   ├── working_memory.py  # 工作记忆（任务状态）
-│   │   └── long_term.py       # 长期记忆（持久化向量存储）
-│   ├── tools/                 # 内置工具
+│   │   ├── base.py              # [新] 工具基类（仿 nanobot agent/tools/base.py）
+│   │   ├── registry.py          # [新] 工具注册中心（仿 nanobot agent/tools/registry.py）
+│   │   ├── tool_definitions.py  # [改] 工具定义（改用新 Tool 基类）
+│   │   ├── filesystem.py        # [新] 文件系统工具（read/write_file）
+│   │   ├── web.py               # [新] Web 工具（web_fetch）
+│   │   └── middleware.py        # [保留] 工具调用中间件
+│   │
+│   ├── memory/
 │   │   ├── __init__.py
-│   │   ├── tool_definitions.py # 工具定义（原有迁移+新增）
-│   │   └── middleware.py      # tool 调用中间件（原有迁移）
-│   ├── planner/               # 任务规划
-│   │   ├── __init__.py
-│   │   ├── task_planner.py    # 任务分解与规划
-│   │   └── task_graph.py      # 依赖图执行引擎
-│   └── middleware/            # Agent 请求中间件
-│       ├── __init__.py
-│       ├── auth.py            # 鉴权
-│       ├── rate_limit.py      # 限流
-│       └── context.py         # 上下文增强
-├── rag/                       # RAG 检索增强
-│   ├── retrieval/
-│   │   ├── __init__.py
-│   │   ├── vector_store.py    # 向量存储操作（原有迁移）
-│   │   ├── bm25_retriever.py  # BM25 检索
-│   │   └── hybrid_retriever.py # 多路召回融合
-│   ├── optimizer/
-│   │   ├── __init__.py
-│   │   └── query_rewrite.py   # 查询改写
-│   ├── reranker/
-│   │   ├── __init__.py
-│   │   └── reranker.py        # 重排序
-│   └── rag_service.py         # RAG 服务入口（原有迁移）
-├── model/                     # 模型封装
-│   ├── __init__.py
-│   ├── factory.py             # 模型工厂（原有迁移）
-│   └── base.py                # 模型抽象基类
-├── api/                       # API 层
-│   ├── __init__.py
-│   ├── app.py                 # FastAPI 主应用
-│   ├── routes.py              # 路由定义
-│   └── schemas.py             # 请求/响应 Schema
-├── config/                    # 配置（原有迁移）
-│   ├── agent.yml
-│   ├── chroma.yml
-│   ├── prompts.yml
-│   └── rag.yml
-├── prompts/                   # Prompt 模板（原有迁移）
-│   ├── main_prompt.txt
-│   ├── rag_summarize.txt
-│   └── report_prompt.txt
-├── data/                      # 数据存储
-│   ├── external/              # 外部系统数据
-│   │   └── records.csv        # （原有迁移）
-│   └── knowledge/             # 知识库文档
-│       ├── *.pdf
-│       └── *.txt
-├── db/                        # 数据库状态（ChromaDB 持久化）
-├── utils/                     # 工具函数（原有迁移）
-│   ├── config.py              # 配置加载
-│   ├── logger.py              # 日志
-│   ├── path_tool.py           # 路径工具
-│   ├── file_handler.py        # 文件处理
-│   └── prompt_loader.py       # Prompt 加载
-├── tests/                     # 测试
-│   ├── test_react_loop.py
-│   ├── test_function_calling.py
-│   └── test_rag.py
-├── docs/                      # 文档
-│   ├── ARCHITECTURE.md        # 本文档
-│   └── API_REFERENCE.md       # API 参考
-├── logs/                      # 日志文件
-├── scripts/                   # 工具脚本
-│   └── init_db.py             # 初始化知识库
-├── requirements.txt           # 依赖
-├── Dockerfile                 # Docker 部署
-├── docker-compose.yml
-├── main.py                    # 入口（Streamlit UI）
-└── README.md
+│   │   ├── memory_store.py      # [新] MEMORY.md + HISTORY.md + MemoryConsolidator
+│   │   ├── context_builder.py   # [新] System Prompt 构建器
+│   │   ├── short_term.py        # [保留] 短期记忆（兼容层）
+│   │   ├── working_memory.py    # [保留] 工作记忆
+│   │   └── long_term.py         # [保留] 向量检索长期记忆
+│   │
+│   ├── session/
+│   │   ├── __init__.py          # [新]
+│   │   └── manager.py           # [新] JSONL 会话管理（仿 nanobot session/manager.py）
+│   │
+│   ├── planner/                 # [保留] 任务规划器
+│   │   └── ...
+│   │
+│   └── middleware/              # [保留] 中间件
+│       └── ...
+│
+├── model/                       # [保留] 模型工厂
+├── api/
+├── config/
+├── prompts/
+├── data/
+├── db/
+├── utils/
+├── tests/
+├── docs/
+│   ├── ARCHITECTURE.md          # [改] 本文档
+│   └── NANOBOT_REFERENCE.md     # [新] nanobot 参考指南
+├── main.py                      # [改] Streamlit UI（适配异步 orchestrator）
+└── requirements.txt
 ```
+
+### 文件说明（[新] vs [改] vs [保留]）
+
+| 文件 | 状态 | 说明 |
+|------|------|------|
+| `agent/loop.py` | **新增** | ReAct 循环核心，仿 nanobot `agent/loop.py` |
+| `agent/core/types.py` | **新增** | LLMResponse, ToolCallRequest, Inbound/OutboundMessage 等 DTO |
+| `agent/core/llm_provider.py` | **新增** | LLM Provider 抽象基类 + 重试退避机制 |
+| `agent/providers/openai_provider.py` | **新增** | OpenAI/DeepSeek 兼容 Provider |
+| `agent/providers/tongyi_provider.py` | **新增** | 通义千问 Provider |
+| `agent/bus/queue.py` | **新增** | asyncio.Queue 消息总线 |
+| `agent/session/manager.py` | **新增** | JSONL 会话持久化 |
+| `agent/tools/base.py` | **新增** | Tool 抽象基类 |
+| `agent/tools/registry.py` | **新增** | ToolRegistry 注册中心 |
+| `agent/tools/filesystem.py` | **新增** | read_file/write_file 工具 |
+| `agent/tools/web.py` | **新增** | web_fetch 工具 |
+| `agent/memory/memory_store.py` | **新增** | MEMORY.md + HISTORY.md 内存管理 |
+| `agent/memory/context_builder.py` | **新增** | 从 workspace 文件构建 System Prompt |
+| `agent/orchestrator.py` | **重写** | 集成新的 AgentLoop + MessageBus |
+| `agent/tools/tool_definitions.py` | **重写** | 改用新的 Tool 基类 |
+| `agent/__init__.py` | **重写** | 统一导出 |
+| `main.py` | **重写** | 适配异步 orchestrator + LLMProvider |
+| `agent/core/react_loop.py` | **保留** | 原有 ReAct 循环（兼容旧代码） |
+| `agent/core/function_calling.py` | **保留** | Function Call 解析器 |
+| `agent/core/tool_registry.py` | **保留** | 装饰器式工具注册 |
+| `agent/core/schema_validator.py` | **保留** | 参数校验器 |
+| `agent/core/fallback.py` | **保留** | 错误回退策略 |
+| `agent/memory/short_term.py` | **保留** | 兼容层 |
+| `agent/memory/working_memory.py` | **保留** | 工作记忆 |
+| `agent/memory/long_term.py` | **保留** | ChromaDB 向量检索 |
 
 ---
 
-## 九、与外卖系统集成架构
+## 十一、与外卖系统集成（保留不变）
 
 ```
-┌─────────────────┐         ┌──────────────────────────────────┐
-│  JD-Agent       │         │  SYSU Campus Food Delivery      │
-│                 │         │  (外卖网站)                       │
-│  ┌───────────┐  │  HTTP   │  ┌────────────┐                  │
-│  │ Agent Core│──┼─────────┼─▶│ Backend    │                  │
-│  └───────────┘  │         │  │ (Go/Gin)   │                  │
-│        │        │         │  └────────────┘                  │
-│        ▼        │         │        │                          │
-│  ┌───────────┐  │         │        ▼                          │
-│  │  New Tools     │         │  ┌────────────┐                  │
-│  │  ─────────  │  │         │  │ MySQL DB  │                  │
-│  │  query_order│  │         │  └────────────┘                  │
-│  │  recommend  │  │         └──────────────────────────────────┘
-│  │  delivery   │  │
-│  └───────────┘  │
-└─────────────────┘
+JD-Agent ──HTTP──▶ SYSU Campus Food Delivery (Go/Gin Backend)
+  │                      │
+  tools:                  └── MySQL DB
+  query_order
+  recommend_dish
+  check_delivery_status
 ```
 
-集成方式：
-1. JD-Agent 通过 HTTP 调用外卖系统的 REST API
-2. 新增工具 `query_order`、`recommend_dish`、`check_delivery_status`
-3. 工具内部封装外卖系统的 API 调用逻辑
-4. 用户通过 Agent 的 Chat 界面与外卖系统交互
+工具内部封装外卖系统的 API 调用逻辑。
 
 ---
 
-## 十、部署架构
+## 十二、部署架构
 
 ```
 ┌───────────────┐     ┌───────────────┐     ┌───────────────┐
-│   Nginx       │────▶│   FastAPI     │────▶│   LLM API     │
-│  (反向代理)    │     │  (Agent)      │     │  (通义千问)    │
+│   Streamlit    │────▶│ AgentOrchestrat│────▶│   LLM API     │
+│   UI / API     │     │   (FastAPI)   │     │  (DeepSeek/通义)│
 └───────────────┘     └───────┬───────┘     └───────────────┘
                               │
-                    ┌─────────▼─────────┐
-                    │    ChromaDB        │
-                    │   (向量存储)        │
-                    └───────────────────┘
+                ┌─────────────┴─────────────┐
+                │           磁盘文件           │
+                │  sessions/{key}.jsonl      │
+                │  memory/MEMORY.md          │
+                │  memory/HISTORY.md         │
+                │  db/chroma_db/ (向量检索)   │
+                └───────────────────────────┘
 ```
 
 ---
 
-> **设计理念**: 参考 OpenClaw 的模块化 + 中间件架构，结合 Claude Code 的规划-执行分离思路，构建一个"自己能说清楚原理、面试能展示亮点"的工程化 Agent 框架。
+## 十三、参考：nanobot ↔ JD-Agent 映射表
+
+| nanobot 模块 | JD-Agent 对应 | 功能 |
+|-------------|--------------|------|
+| `agent/loop.py` | `agent/loop.py` | ReAct 循环 |
+| `providers/base.py` | `agent/core/llm_provider.py` | Provider 抽象 |
+| `bus/queue.py` | `agent/bus/queue.py` | 消息队列 |
+| `bus/events.py` | `agent/core/types.py` | 消息类型 |
+| `agent/context.py` | `agent/memory/context_builder.py` | System Prompt |
+| `agent/memory.py` | `agent/memory/memory_store.py` | 记忆管理 |
+| `agent/tools/base.py` | `agent/tools/base.py` | 工具基类 |
+| `agent/tools/registry.py` | `agent/tools/registry.py` | 工具注册 |
+| `session/manager.py` | `agent/session/manager.py` | 会话持久化 |
+| `config/schema.py` | `agent/core/types.py` + config/ | 配置 |
+
+---
+
+> **设计理念**: 参考 nanobot（OpenClaw 的 Python 轻量替代）的 MessageBus + Provider + ReAct Loop 三位一体架构，结合原有 jd_agent 的工具系统和 RAG 能力，构建一个"自己能说清楚原理、面试能展示亮点"的工程化 Agent 框架。
