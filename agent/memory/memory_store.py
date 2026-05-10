@@ -2,15 +2,18 @@
 Agent Core: 记忆系统（三层记忆）
 参考 nanobot 的 agent/memory.py 设计
 
-记忆系统分为三层：
+记忆系统分为四层：
 1. MEMORY.md（长期事实）— 跨会话持久化的用户偏好、关键事实
 2. HISTORY.md（历史日志）— grep 可搜索的行为日志
-3. Session Messages（短期记忆）— 当前会话上下文（由 session/manager.py 管理）
+3. history.jsonl（中期压缩记忆）— Consolidator 将旧对话压缩为摘要条目
+4. Session Messages（短期记忆）— 当前会话上下文（由 session/manager.py 管理）
 
 关键特点：
 - MemoryStore 负责文件级别的读写
+- HistoryJsonlStore 负责 history.jsonl 的追加/读取（对标 nanobot 的 history.jsonl）
 - MemoryConsolidator 负责在合适的时机（按时间/消息数）自动 consolidation
 - Consolidation 通过 LLM tool call 让模型自己决定写什么
+- Dream 定期从 history.jsonl 提取原子事实更新 MEMORY.md
 """
 
 import json
@@ -63,6 +66,7 @@ class MemoryStore:
         self.memory_dir = _ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
+        self.history_jsonl = HistoryJsonlStore(workspace)  # 新增：history.jsonl 管线
 
     # ─── MEMORY.md 读写 ────────────────────────
 
@@ -87,6 +91,84 @@ class MemoryStore:
         """追加一条历史日志"""
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
+
+
+class HistoryJsonlStore:
+    """history.jsonl 存储层（对标 nanobot 的 history.jsonl 管线）
+
+    格式：每行一个 JSON，包含：
+    - type: "consolidation" | "dream_note" | "user_event"
+    - summary: 摘要文本
+    - message_count: 压缩的消息数
+    - cursor: 消息位置指针
+    - timestamp: ISO 时间戳
+    - session_key: 会话标识
+    """
+
+    def __init__(self, workspace: Path, max_entries: int = 500):
+        self.history_file = _ensure_dir(workspace / "memory") / "history.jsonl"
+        self.max_entries = max_entries
+
+    def append(self, entry: dict) -> None:
+        """追加一条 JSON 到 history.jsonl"""
+        with open(self.history_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def read_all(self) -> list[dict]:
+        """读取全部条目"""
+        entries: list[dict] = []
+        if not self.history_file.exists():
+            return entries
+        with open(self.history_file, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        entries.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+        return entries
+
+    def read_since_cursor(self, cursor: int) -> list[dict]:
+        """返回 cursor 之后的所有条目"""
+        return [e for e in self.read_all() if e.get("cursor", 0) > cursor]
+
+    def compact(self) -> None:
+        """超限时丢弃最旧条目"""
+        if self.max_entries <= 0:
+            return
+        entries = self.read_all()
+        if len(entries) <= self.max_entries:
+            return
+        kept = entries[-self.max_entries:]
+        self._overwrite(kept)
+
+    def _overwrite(self, entries: list[dict]) -> None:
+        """原子覆盖写入"""
+        tmp = self.history_file.with_suffix(".jsonl.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, self.history_file)
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def get_last_dream_cursor(self) -> int:
+        """读取 Dream 已处理到的 cursor 位置"""
+        cursor_file = self.history_file.parent / ".dream_cursor"
+        try:
+            return int(cursor_file.read_text(encoding="utf-8").strip())
+        except (FileNotFoundError, ValueError):
+            return 0
+
+    def set_last_dream_cursor(self, cursor: int) -> None:
+        """记录 Dream 最后一次处理到的 cursor 位置"""
+        cursor_file = self.history_file.parent / ".dream_cursor"
+        cursor_file.write_text(str(cursor), encoding="utf-8")
 
 
 def _ensure_dir(path: Path) -> Path:
@@ -215,6 +297,18 @@ class MemoryConsolidator:
                     # 写入 HISTORY.md
                     if history_entry:
                         self.memory.append_history(history_entry)
+                    # 同时写入 history.jsonl（对标 nanobot 的 history.jsonl 管线）
+                    if history_entry:
+                        self.memory.history_jsonl.append({
+                            "type": "consolidation",
+                            "session_key": session.key,
+                            "summary": history_entry,
+                            "memory_update": memory_update or "",
+                            "message_count": len(unconsolidated),
+                            "cursor": len(session.messages),
+                            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                        })
+                        self.memory.history_jsonl.compact()
                     # 更新 MEMORY.md
                     if memory_update:
                         self.memory.write_long_term(memory_update)

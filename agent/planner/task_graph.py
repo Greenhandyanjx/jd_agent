@@ -14,6 +14,10 @@ class TaskExecutor:
     """
     任务执行引擎
     按拓扑排序的顺序执行子任务
+
+    扩展（参考 nanobot 记忆管线）：
+    - 执行完成后将任务结果写入 history.jsonl
+    - 支持记忆感知的循环（每个子任务前加载上下文）
     """
 
     def __init__(self, planner: TaskPlanner = None, react_loop: ReactLoop = None):

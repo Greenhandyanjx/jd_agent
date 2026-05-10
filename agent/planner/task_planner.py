@@ -3,11 +3,13 @@ Planner: 任务规划器
 借鉴 Claude Code 的 Plan-Solve 模式，
 将复杂任务分解为可执行的子任务 DAG
 """
-from typing import Optional
+import json
+from typing import Any, Optional
 from datetime import datetime
-from utils.logger import logger
+from loguru import logger
 from model.factory import chat_model as llm
 from agent.memory.working_memory import WorkingMemory
+from agent.memory.memory_store import MemoryStore
 
 
 class Task:
@@ -43,26 +45,36 @@ class TaskPlanner:
     """
     任务规划器：
     1. 接收用户复杂请求
-    2. 调用LLM进行任务分解
+    2. 调用LLM进行任务分解（结合长期记忆）
     3. 构建任务依赖图
     4. 逐步执行
+
+    扩展（参考 nanobot 记忆管线）：
+    - 规划时自动加载长期记忆（MEMORY.md），让 LLM 的拆解更明智
+    - 任务执行后自动记录到 history.jsonl（供 Dream 归档）
+    - 复合任务执行完成后触发 consolidation
     """
 
-    def __init__(self, working_memory: WorkingMemory = None):
+    def __init__(self, working_memory: WorkingMemory = None,
+                 memory_store: MemoryStore = None,
+                 history_jsonl: Any = None):
         self.working_memory = working_memory or WorkingMemory()
         self.tasks: dict[str, Task] = {}
         self.llm = llm
+        self.memory_store = memory_store  # 新增：长期记忆注入
+        self.history_jsonl = history_jsonl  # 新增：history.jsonl 注入
 
-    def plan(self, user_query: str, context: Optional[dict] = None) -> list[Task]:
-        """
-        根据用户请求生成任务计划
-        返回任务列表（按执行顺序）
-        """
-        logger.info(f"[TaskPlanner] 开始规划任务: {user_query[:50]}...")
+    def _build_plan_prompt(self, user_query: str) -> str:
+        """构建含长期记忆感知的任务分解提示词。"""
+        memory_context = ""
+        if self.memory_store:
+            long_term = self.memory_store.read_long_term()
+            if long_term.strip():
+                memory_context = f"\n用户已知信息：\n{long_term[:1500]}\n"
 
-        plan_prompt = f"""你是一个任务规划器。请将以下用户请求分解为可执行的子任务列表。
+        return f"""你是一个任务规划器。请将以下用户请求分解为可执行的子任务列表。
 
-用户请求: {user_query}
+用户请求: {user_query}{memory_context}
 
 请以 JSON 格式返回任务列表，格式如下:
 {{
@@ -70,9 +82,9 @@ class TaskPlanner:
         {{
             "task_id": "task_1",
             "name": "简短任务名",
-            "description": "任务描述",
-            "depends_on": [],  // 依赖的任务ID列表，没有则空数组
-            "tool_name": "需要的工具名"  // 不需要工具则为 null
+            "description": "具体执行描述",
+            "depends_on": [],
+            "tool_name": null
         }},
         ...
     ]
@@ -83,6 +95,15 @@ class TaskPlanner:
 2. 明确标识任务间的依赖关系
 3. 任务名简短明确
 4. 工具名必须来自可用工具列表"""
+
+    def plan(self, user_query: str, context: Optional[dict] = None) -> list[Task]:
+        """
+        根据用户请求生成任务计划
+        返回任务列表（按执行顺序）
+        """
+        logger.info(f"[TaskPlanner] 开始规划任务: {user_query[:50]}...")
+
+        plan_prompt = self._build_plan_prompt(user_query)
 
         try:
             response = self.llm.invoke([

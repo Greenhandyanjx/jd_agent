@@ -57,7 +57,7 @@ st.set_page_config(
 st.title("🤖 JD-Agent 智能助手")
 st.caption(
     "基于 ReAct 架构 · 参考 OpenClaw → nanobot 设计 | "
-    "支持工具调用 · 三层记忆 · 会话持久化"
+    "支持工具调用 · 四层记忆(MEMORY/HISTORY/history.jsonl/Session) · 会话持久化"
 )
 st.divider()
 
@@ -89,26 +89,51 @@ with st.sidebar:
         for t_name in tools:
             st.markdown(f"- **{t_name}**")
 
-    # 会话管理
-    if st.button("🔄 清空对话", use_container_width=True):
-        st.session_state.orchestrator.clear_session()
-        st.session_state.messages = []
-        st.rerun()
+    # 记忆操作区
+    orche = st.session_state.orchestrator
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("🔄 清空对话", use_container_width=True):
+            orche.clear_session()
+            st.session_state.messages = []
+            st.rerun()
+    with col2:
+        if st.button("🌙 运行 Dream", use_container_width=True):
+            if orche.loop and orche.loop.chat_memory:
+                result = orche.loop.chat_memory.run_dream()
+                st.info(f"Dream 完成: +{result.get('added',0)} 新增, "
+                        f"替换{result.get('replaced',0)}, "
+                        f"跳过{result.get('skipped',0)}")
+            else:
+                st.info("Agent 尚未初始化")
+
+    # 记忆状态
+    with st.expander("🧠 记忆状态"):
+        if orche.loop and orche.loop.chat_memory:
+            status = orche.loop.chat_memory.status()
+            st.json(status)
+        else:
+            st.info("记忆系统未初始化")
 
     # 架构信息
     with st.expander("📖 架构说明"):
         st.markdown("""
         ### JD-Agent v2 架构（参考 nanobot）
         
-        | 层 | 功能 |
-        |---|---|
-        | **AgentLoop** | ReAct 循环引擎（Think→Act→Observe） |
-        | **MessageBus** | 异步消息总线 |
-        | **LLMProvider** | 模型抽象（切换模型） |
-        | **ToolRegistry** | 工具注册与调度 |
-        | **SessionManager** | 会话 JSONL 持久化 |
-        | **MemoryStore** | MEMORY.md + HISTORY.md |
-        | **MemoryConsolidator** | 自动记忆总结 |
+        | 层 | 功能 | 对标 nanobot |
+        |---|---|---|
+        | **AgentLoop** | ReAct 循环引擎 | agent/loop.py |
+        | **MessageBus** | 异步消息总线 | bus/queue.py |
+        | **LLMProvider** | 模型抽象 | providers/ |
+        | **ToolRegistry** | 工具注册与调度 | tools/ |
+        | **SessionManager** | 会话 JSONL 持久化 | session/manager.py |
+        | **MemoryStore** | MEMORY.md + HISTORY.md | memory/memory_store.py |
+        | **HistoryJsonl** | history.jsonl 管线 | ✅ 新增 |
+        | **MemoryConsolidator** | 自动记忆总结 | ✅ 保留增强 |
+        | **Dream** | 长期记忆整理 | ✅ 新增 |
+        | **ChatMemory** | 三层记忆封装 | ✅ 新增 |
+        | **TaskPlanner** | 任务规划（记忆感知） | ✅ 保留增强 |
         """)
 
 # ─── 消息显示 ────────────────────────────────

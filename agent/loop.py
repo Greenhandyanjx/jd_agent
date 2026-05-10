@@ -39,6 +39,8 @@ from agent.tools.filesystem import ReadFileTool, WriteFileTool
 from agent.tools.web import WebFetchTool
 from agent.memory.context_builder import ContextBuilder
 from agent.memory.memory_store import MemoryConsolidator
+from agent.memory.dream import Dream
+from agent.memory.chat_memory import ChatMemory
 
 if TYPE_CHECKING:
     pass
@@ -91,7 +93,7 @@ class AgentLoop:
         self.sessions = SessionManager(workspace)
         self.tools = ToolRegistry()
 
-        # 记忆 Consolidation
+        # 记忆 Consolidation（已有）
         self.memory_consolidator = MemoryConsolidator(
             workspace=workspace,
             provider=provider,
@@ -100,6 +102,10 @@ class AgentLoop:
             context_builder=self.context,
             sessions=self.sessions,
         )
+
+        # 新增：ChatMemory 门面和 Dream（对标 nanobot 的 Dream）
+        self.chat_memory = ChatMemory(workspace=workspace)
+        self.dream = self.chat_memory.dream
 
         # 运行状态
         self._running = False
@@ -410,6 +416,19 @@ class AgentLoop:
 
         # 触发记忆 consolidation
         await self.memory_consolidator.maybe_consolidate(session)
+
+        # 触发 Dream 归档（每 5 轮 consolidation 一次）
+        if not hasattr(self, '_dream_tick'):
+            self._dream_tick = 0
+        self._dream_tick += 1
+        if self._dream_tick >= 5:
+            self._dream_tick = 0
+            try:
+                dream_result = self.chat_memory.run_dream()
+                if dream_result.get('added', 0) > 0 or dream_result.get('replaced', 0) > 0:
+                    logger.info(f"[Dream] 归档完成: {dream_result}")
+            except Exception as exc:
+                logger.warning(f"[Dream] 归档失败: {exc}")
 
         preview_rsp = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"[Agent] 回复 {msg.channel}:{msg.sender_id}: {preview_rsp}")
