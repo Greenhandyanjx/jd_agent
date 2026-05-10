@@ -17,7 +17,10 @@ from typing import Any
 from loguru import logger
 
 from agent.tools.base import Tool
-from tools.rag_service import RagSummarizeService
+try:
+    from tools.rag_service import RagSummarizeService
+except ModuleNotFoundError:
+    from rag.rag_service import RagSummarizeService
 
 # RAG 服务单例
 _rag = RagSummarizeService()

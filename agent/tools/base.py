@@ -65,15 +65,18 @@ class Tool(ABC):
 
     def to_schema(self) -> dict[str, Any]:
         """
-        转为 OpenAI Function Calling 格式的 Schema。
-        
-        这是 Agent 发送给 LLM 的工具定义格式。
+        Convert to OpenAI Function Calling format Schema.
+        Strips inner "required" flags from property schemas.
         """
-        param_schema = self.parameters or {}
-        required = [
-            name for name, schema in param_schema.items()
-            if schema.get("required", False)
-        ]
+        raw_params = self.parameters or {}
+        properties = {}
+        required = []
+        for name, schema in raw_params.items():
+            if isinstance(schema, dict):
+                is_required = schema.pop("required", False)
+                if is_required:
+                    required.append(name)
+            properties[name] = schema
         return {
             "type": "function",
             "function": {
@@ -81,7 +84,7 @@ class Tool(ABC):
                 "description": self.description,
                 "parameters": {
                     "type": "object",
-                    "properties": self.parameters,
+                    "properties": properties,
                     "required": required,
                 },
             },

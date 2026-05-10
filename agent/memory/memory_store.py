@@ -17,6 +17,7 @@ Agent Core: 记忆系统（三层记忆）
 """
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -297,7 +298,7 @@ class MemoryConsolidator:
                     # 写入 HISTORY.md
                     if history_entry:
                         self.memory.append_history(history_entry)
-                    # 同时写入 history.jsonl（对标 nanobot 的 history.jsonl 管线）
+                    # 同时写入 history.jsonl
                     if history_entry:
                         self.memory.history_jsonl.append({
                             "type": "consolidation",

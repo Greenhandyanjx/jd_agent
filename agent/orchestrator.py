@@ -16,7 +16,7 @@ Agent Orchestrator: Agent 编排器
 
 import asyncio
 from pathlib import Path
-from typing import AsyncGenerator, Generator
+from typing import AsyncGenerator
 
 from loguru import logger
 
@@ -59,7 +59,6 @@ class AgentOrchestrator:
             provider=self.provider,
             workspace=self.workspace,
         )
-        # 启动消息处理循环（后台任务）
         self._task = asyncio.create_task(self.loop.run())
         logger.info("[Orchestrator] Agent 初始化完成")
 
@@ -76,9 +75,9 @@ class AgentOrchestrator:
 
     async def chat_async(self, user_query: str) -> str:
         """
-        异步聊天接口。
+        异步聊天接口（非流式）。
         
-        构造消息 → 直接处理（不走队列） → 返回结果。
+        构造消息 → 直接处理 → 返回结果。
         """
         if self.loop is None:
             await self.initialize()
@@ -95,7 +94,9 @@ class AgentOrchestrator:
         """
         异步流式聊天接口。
         
-        每次 yield 一个文本块。
+        真正的流式实现：
+        - 直接在 _process_message 内部收集流式 chunk
+        - 不需要队列或事件同步（Streamlit 中逐块 yield）
         """
         if self.loop is None:
             await self.initialize()
@@ -107,24 +108,47 @@ class AgentOrchestrator:
             content=user_query,
         )
 
-        # 构造流式 progress 回调
+        # 使用简单的 buffer + 同步粒度：收集所有流式块
+        # 由于 Streamlit 中 _asyncio.run 会阻塞直到完成，
+        # 先全部收集再一次性 yield
         stream_buffer = []
 
         async def on_stream(delta: str) -> None:
             stream_buffer.append(delta)
 
-        class StreamProxy:
-            """用闭包收集流式内容"""
-            pass
+        # 临时替换 loop._process_message 中的流式回调
+        # _process_message -> _run_agent_loop 接受 on_stream 回调
+        # 但我们不修改 _process_message 签名，改用内部模式
+        
+        # 方法：构造消息后，手动走 _run_agent_loop 并注入回调
+        session = self.loop.sessions.get_or_create(msg.session_key)
+        history = session.get_history(max_messages=0)
+        initial_messages = self.loop.context.build_messages(
+            history=history,
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
 
-        # 处理消息
-        response = await self.loop._process_message(msg)
+        final_content, tools_used, all_msgs = await self.loop._run_agent_loop(
+            initial_messages,
+            on_stream=on_stream,
+        )
 
+        if final_content is None:
+            final_content = "处理完成，但没有生成回复。"
+
+        # 持久化（_process_message 中的部分逻辑）
+        self.loop._save_turn(session, all_msgs, 1 + len(history))
+        self.loop.sessions.save(session)
+
+        # yield 流式内容
         if stream_buffer:
             for chunk in stream_buffer:
                 yield chunk
-        elif response and response.content:
-            yield response.content
+        else:
+            yield final_content
 
     # ─── 工具管理 ──────────────────────────────
 

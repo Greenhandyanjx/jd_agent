@@ -69,8 +69,16 @@ if "initialized" not in st.session_state:
         provider=st.session_state.provider,
         workspace="D:\\桌面\\深度学习\\jd_agent",
     )
-    # 注册业务工具
-    register_all_tools(st.session_state.orchestrator.get_tool_registry())
+    import asyncio as _asyncio_init
+    _loop_init = _asyncio_init.new_event_loop()
+    _asyncio_init.set_event_loop(_loop_init)
+    try:
+        _loop_init.run_until_complete(st.session_state.orchestrator.initialize())
+    finally:
+        _loop_init.close()
+    registry = st.session_state.orchestrator.get_tool_registry()
+    if registry is not None:
+        register_all_tools(registry)
     st.session_state.initialized = True
 
 if "messages" not in st.session_state:
@@ -156,19 +164,24 @@ if prompt:
         import asyncio as _asyncio
 
         response_container = st.empty()
-        full_response = ""
 
         with st.spinner("🤔 思考中..."):
             try:
-                # 流式输出
-                async def stream_chat():
-                    nonlocal full_response
-                    async for chunk in st.session_state.orchestrator.chat_stream_async(prompt):
-                        full_response += chunk
-                        response_container.markdown(full_response + "▌")
-                    return full_response
+                # 使用新的事件循环来运行异步代码（避免嵌套事件循环）
+                _loop = _asyncio.new_event_loop()
+                _asyncio.set_event_loop(_loop)
+                try:
+                    async def stream_chat():
+                        full = ""
+                        async for chunk in st.session_state.orchestrator.chat_stream_async(prompt):
+                            full += chunk
+                            response_container.markdown(full + "▌")
+                        return full
 
-                result = _asyncio.run(stream_chat())
+                    result = _loop.run_until_complete(stream_chat())
+                finally:
+                    _loop.close()
+
                 response_container.markdown(result)
 
             except Exception as e:

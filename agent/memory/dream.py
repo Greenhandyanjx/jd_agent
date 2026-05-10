@@ -213,6 +213,10 @@ class Dream:
             logger.warning(f"[Dream] 提取事实失败: {e}")
             return []
 
+    def _builtin_dedup(self, prompt: str) -> str:
+        """无 LLM 时的内置降级：直接返回所有事实作为新增。"""
+        return '{"to_skip": [], "to_replace": {}, "to_add": []}'
+
     def _builtin_summarizer(self, prompt: str) -> str:
         """无 LLM 时的内置降级：直接取摘要的前几句。"""
         # prompt 的最后一段是 "对话摘要：\n{summary}"
