@@ -17,13 +17,10 @@ from typing import Any
 from loguru import logger
 
 from agent.tools.base import Tool
-try:
-    from tools.rag_service import RagSummarizeService
-except ModuleNotFoundError:
-    from rag.rag_service import RagSummarizeService
+from rag.rag_service import RagRetrievalService
 
-# RAG 服务单例
-_rag = RagSummarizeService()
+# RAG 检索服务单例（纯检索，不生成回答）
+_rag = RagRetrievalService()
 
 # Mock 数据
 CITIES = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉"]
@@ -34,7 +31,18 @@ USER_IDS = ["1001", "1002", "1003", "1004", "1005"]
 
 
 class RAGQueryTool(Tool):
-    """RAG 检索增强查询"""
+    """
+    RAG 检索工具 ⚠️ 只检索，不生成回答
+    
+    将知识库中的相关文档内容返回给 Agent，
+    Agent 拿到文档后自主思考并生成最终回答。
+    
+    支持：
+    - 多路召回（向量+BM25+RRF融合）
+    - Query Rewrite（LLM+规则双路）
+    - Reranker 重排序
+    - 重试+降级保护
+    """
 
     @property
     def name(self) -> str:
@@ -42,20 +50,24 @@ class RAGQueryTool(Tool):
 
     @property
     def description(self) -> str:
-        return "RAG 检索增强查询：基于知识库文档回答用户关于产品、使用方法的专业问题"
+        return (
+            "RAG 知识库检索：从产品文档/知识库中检索与用户问题相关的内容。"
+            "当你需要专业知识或产品信息时调用此工具，它会返回相关文档内容。"
+        )
 
     @property
     def parameters(self) -> dict[str, Any]:
         return {
             "query": {
                 "type": "string",
-                "description": "查询内容",
+                "description": "查询内容，如：'什么是机器学习？'",
                 "required": True,
             },
         }
 
     async def execute(self, query: str, **kwargs: Any) -> str:
-        return _rag.rag_summarize(query)
+        """检索知识库，返回原始文档内容（不生成回答）"""
+        return _rag.retrieve(query)
 
 
 class WeatherTool(Tool):
