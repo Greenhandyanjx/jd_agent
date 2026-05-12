@@ -73,7 +73,7 @@ class AgentOrchestrator:
         """
         return asyncio.run(self.chat_async(user_query))
 
-    async def chat_async(self, user_query: str) -> str:
+    async def chat_async(self, user_query: str, session_key: str = "cli:direct") -> str:
         """
         异步聊天接口（非流式）。
         
@@ -84,13 +84,13 @@ class AgentOrchestrator:
 
         response = await self.loop.process_direct(
             content=user_query,
-            session_key="cli:direct",
+            session_key=session_key,
             channel="cli",
             chat_id="direct",
         )
         return response.content if response else ""
 
-    async def chat_stream_async(self, user_query: str) -> AsyncGenerator[str, None]:
+    async def chat_stream_async(self, user_query: str, session_key: str = "cli:direct") -> AsyncGenerator[str, None]:
         """
         异步流式聊天接口。
         

@@ -1,28 +1,79 @@
+# ─────────────────────────────────────────────────────────
+# Docker Compose — JD-Agent 前后端分离部署
+# ─────────────────────────────────────────────────────────
+#
+# 使用方式:
+#   1. 复制 .env.example 为 .env 并填入 API Key
+#   2. docker compose up -d
+#   3. 访问 http://localhost:8501 (Streamlit UI)
+#
+# 如需单独调试 API:
+#   curl http://localhost:8000/api/v1/health
+#
+# 环境变量参考 (.env):
+#   DEEPSEEK_API_KEY=sk-xxx          # 你的 API Key
+#   DEFAULT_MODEL=deepseek-chat       # 模型名
+#   API_PORT=8000                     # API 端口
+#   STREAMLIT_PORT=8501               # Streamlit 端口
+# ─────────────────────────────────────────────────────────
+
 version: '3.8'
 
 services:
+  # ── API 后端（FastAPI） ──
   api:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jd-agent:latest
+    container_name: jd-agent-api
     ports:
-      - "8000:8000"
+      - "${API_PORT:-8000}:8000"
     environment:
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - DEFAULT_MODEL=${DEFAULT_MODEL:-deepseek-chat}
+      - PYTHONPATH=/app
+      - LOG_LEVEL=info
     volumes:
-      - ./db:/app/db
-      - ./logs:/app/logs
-    command: python -m api.app
+      # 持久化：数据库（Chroma 向量库）、会话、日志
+      - jd-agent-db:/app/db
+      - jd-agent-logs:/app/logs
+      - jd-agent-sessions:/app/sessions
+      - jd-agent-memory:/app/memory
+    command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --log-level info
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
+  # ── 前端（Streamlit） ──
+  ui:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: jd-agent:latest
+    container_name: jd-agent-ui
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    environment:
+      - JD_AGENT_API_URL=http://api:8000   # Docker 网络内通过服务名访问
+      - PYTHONPATH=/app
+    depends_on:
+      api:
+        condition: service_healthy
+    command: >
+      streamlit run main.py
+      --server.port 8501
+      --server.address 0.0.0.0
+      --server.headless true
     restart: unless-stopped
 
-  ui:
-    build: .
-    ports:
-      - "8501:8501"
-    environment:
-      - DASHSCOPE_API_KEY=${DASHSCOPE_API_KEY}
-    volumes:
-      - ./db:/app/db
-      - ./logs:/app/logs
-    command: streamlit run main.py --server.port 8501 --server.address 0.0.0.0
-    depends_on:
-      - api
-    restart: unless-stopped
+volumes:
+  jd-agent-db:
+  jd-agent-logs:
+  jd-agent-sessions:
+  jd-agent-memory:
