@@ -27,7 +27,8 @@ logs/
 .DS_Store
 Thumbs.db
 
-# 会话/工作区文件（本地敏感数据）
+# 记忆/会话/工作区文件（本地敏感数据）
+memory/
 sessions/cli_direct.jsonl
 agent/jd_agent.code-workspace
 
