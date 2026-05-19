@@ -27,6 +27,10 @@ logs/
 .DS_Store
 Thumbs.db
 
+# 会话/工作区文件（本地敏感数据）
+sessions/cli_direct.jsonl
+agent/jd_agent.code-workspace
+
 # 测试
 .coverage
 .pytest_cache/
