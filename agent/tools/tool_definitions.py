@@ -17,6 +17,12 @@ from typing import Any
 from loguru import logger
 
 from agent.tools.base import Tool
+from agent.tools.delivery_tools import (
+    QueryOrderTool,
+    RecommendDishTool,
+    CheckDeliveryStatusTool,
+    CustomerServiceTool,
+)
 from rag.rag_service import RagRetrievalService
 
 # RAG 检索服务单例（纯检索，不生成回答）
@@ -261,9 +267,15 @@ def register_all_tools(registry) -> None:
         UserLocationTool(),
         UserIDTool(),
         CurrentMonthTool(),
+        # 旧的 Mock 工具（保留向后兼容）
         OrderQueryTool(),
         DishRecommendTool(),
         DeliveryStatusTool(),
+        # 新的配送业务工具（对接真实后端）
+        QueryOrderTool(),
+        RecommendDishTool(),
+        CheckDeliveryStatusTool(),
+        CustomerServiceTool(),
     ]
     for tool in tools:
         registry.register(tool)
