@@ -1,0 +1,29 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import sys; sys.path.insert\\(0, '.'\\); from api.app import app; print\\(f'API imports OK. Routes: {len\\(app.routes\\)}'\\)\")",
+      "Bash(python -m api.app)",
+      "Bash(curl -s http://127.0.0.1:8000/api/v1/health)",
+      "Bash(kill %1)",
+      "Bash(taskkill /F /FI \"WINDOWTITLE eq *api.app*\")",
+      "Bash(taskkill /F /FI \"WINDOWTITLE eq *uvicorn*\")",
+      "Bash(netstat -ano)",
+      "Bash(taskkill /PID 10204 /F)",
+      "Bash(powershell -command \"Get-Process -Id \\(Get-NetTCPConnection -LocalPort 8000\\).OwningProcess | Stop-Process -Force\")",
+      "Bash(python -c \"import socket; s=socket.socket\\(\\); s.settimeout\\(2\\); print\\('used' if s.connect_ex\\(\\('127.0.0.1',8000\\)\\)==0 else 'free'\\); s.close\\(\\)\")",
+      "Bash(taskkill /F /FI \"WINDOWTITLE eq JD-Agent API\")",
+      "Bash(curl -s -X POST http://127.0.0.1:8000/api/v1/chat -H 'Content-Type: application/json' -d '{\"message\": \"查一下今天珠海的天气\", \"stream\": false}')",
+      "Bash(python -c \"import sys, json; d = json.load\\(sys.stdin\\); print\\(d.get\\('response',''\\)[:500]\\)\")",
+      "Bash(curl -s -X POST http://127.0.0.1:8000/api/v1/chat -H 'Content-Type: application/json' -d '{\"message\": \"查一下今天珠海的天气\", \"stream\": false}' --max-time 120)",
+      "Bash(echo '{\"message\": \"查一下今天珠海的天气\", \"stream\": false}')",
+      "Bash(curl -s -X POST \"http://127.0.0.1:8000/api/v1/chat\" -H \"Content-Type: application/json\" -d @/tmp/weather_req.json --max-time 120)",
+      "Bash(curl -s -X POST \"http://127.0.0.1:8000/api/v1/chat\" -H \"Content-Type: application/json\" -d '{\"message\": \"查一下今天珠海的天气\", \"stream\": false}' --max-time 120)",
+      "Bash(printf '{\"message\":\"查一下今天珠海的天气\",\"stream\":false}')",
+      "Bash(curl -s -X POST \"http://127.0.0.1:8000/api/v1/chat\" -H \"Content-Type: application/json\" -d @/tmp/weather.json --max-time 120)",
+      "Bash(taskkill /PID 31572 /F)",
+      "Bash(powershell -Command \"Get-Process -Id \\(Get-NetTCPConnection -LocalPort 8000\\).OwningProcess | Stop-Process -Force\")",
+      "Bash(powershell -Command \"taskkill /PID 6232 /F\")"
+    ]
+  }
+}

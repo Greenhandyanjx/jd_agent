@@ -203,7 +203,14 @@ with st.sidebar:
     # ── 后端状态 ──
     status = get_api_status()
     if status.get("status") == "ok":
-        st.success(f"✅ API 在线 | 工具 {status.get('tools_count', 0)} 个")
+        tools_n = status.get('tools_count', 0)
+        skills_n = status.get('skills_count', 0)
+        skills_names = status.get('skills_names', [])
+        skill_badge = f" | 技能 {skills_n} 个" if skills_n > 0 else ""
+        st.success(f"✅ API 在线 | 工具 {tools_n} 个{skill_badge}")
+        # 技能标签展示
+        if skills_names:
+            st.markdown(" ".join([f"🏷️ {s}" for s in skills_names]))
     else:
         st.error(f"❌ API 离线: {status.get('detail', '连接超时')}")
         st.info("请先在终端启动 API:  python -m api.app")
@@ -228,10 +235,31 @@ with st.sidebar:
             else:
                 st.info("尚无会话 ID")
 
+    # ── 技能系统说明 ──
+    with st.expander("🎯 技能系统（Skill System）"):
+        if status.get('skills_count', 0) > 0:
+            st.markdown(f"""
+            ### 已加载技能
+            
+            共有 **{skills_n}** 个技能包被自动发现并加载：
+            """)
+            for sname in skills_names:
+                st.markdown(f"- 🎯 **{sname}**")
+        else:
+            st.info("暂无 Skill 技能包被加载。")
+        st.markdown("""
+        ---
+        技能系统特性：
+        - 📂 **自动发现** — 扫描 `skills/` 目录
+        - 📄 **SKILL.md** — 每个技能带文档声明
+        - 🧠 **意图匹配** — 根据用户输入智能匹配合适技能
+        - 🔌 **可插拔** — 新增/删除技能目录即可热更新
+        """)
+
     # ── 架构说明 ──
     with st.expander("📖 架构说明"):
         st.markdown("""
-        ### JD-Agent 架构（前后端分离）
+        ### JD-Agent 架构（前后端分离 + 技能系统）
 
         ```
         ┌─────────────────┐     HTTP/SSE     ┌──────────────────┐
@@ -241,10 +269,10 @@ with st.sidebar:
                                                        │
                                               ┌────────▼─────────┐
                                               │ AgentOrchestrator │
-                                              │  - ReAct Loop     │
-                                              │  - Tool Registry  │
-                                              │  - Session Mgr    │
-                                              │  - Memory Store   │
+                                              │  ┌───────────┐   │
+                                              │  │ Skill     │   │
+                                              │  │ Manager   │──→│ ←skills/ 目录
+                                              │  └───────────┘   │
                                               └──────────────────┘
         ```
 
@@ -252,7 +280,7 @@ with st.sidebar:
         |------|------|------|
         | Streamlit UI | 8501 | 聊天界面 &rarr; 调后端 API |
         | FastAPI | 8000 | REST & SSE 端点 |
-        | Agent | 内部 | ReAct 循环 + 工具 + 记忆 |
+        | Agent | 内部 | ReAct 循环 + 工具 + 记忆 + **技能系统** |
         """)
 
     # ── 环境变量说明 ──

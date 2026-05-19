@@ -18,6 +18,7 @@ from agent.core.types import (
     InboundMessage,
     OutboundMessage,
     GenerationSettings,
+    SkillMatch,
 )
 from agent.core.llm_provider import LLMProvider
 from agent.bus.queue import MessageBus
@@ -28,6 +29,9 @@ from agent.tools.registry import ToolRegistry
 from agent.session.manager import SessionManager, Session
 from agent.memory.memory_store import MemoryStore, MemoryConsolidator
 from agent.memory.context_builder import ContextBuilder
+from agent.skills.base import Skill, SkillAbility, SkillAsset
+from agent.skills.manager import SkillManager
+from agent.skills.loader import SkillLoader, SkillDiscoveryResult
 
 __all__ = [
     # 类型
@@ -36,6 +40,7 @@ __all__ = [
     "InboundMessage",
     "OutboundMessage",
     "GenerationSettings",
+    "SkillMatch",
     # 核心
     "LLMProvider",
     "MessageBus",
@@ -51,4 +56,11 @@ __all__ = [
     "MemoryStore",
     "MemoryConsolidator",
     "ContextBuilder",
+    # 技能
+    "Skill",
+    "SkillAbility",
+    "SkillAsset",
+    "SkillManager",
+    "SkillLoader",
+    "SkillDiscoveryResult",
 ]

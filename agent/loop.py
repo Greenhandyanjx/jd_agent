@@ -41,6 +41,8 @@ from agent.memory.context_builder import ContextBuilder
 from agent.memory.memory_store import MemoryConsolidator
 from agent.memory.dream import Dream
 from agent.memory.chat_memory import ChatMemory
+from agent.skills.manager import SkillManager
+from agent.skills.loader import SkillLoader
 
 if TYPE_CHECKING:
     pass
@@ -69,6 +71,7 @@ class AgentLoop:
         model: str | None = None,
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
+        skills_dir: str | Path | None = None,
     ):
         """初始化 Agent Loop。
 
@@ -79,6 +82,7 @@ class AgentLoop:
             model: 模型名，默认使用 provider 的默认模型
             max_iterations: 最大 ReAct 循环轮数
             context_window_tokens: 上下文窗口大小（用于记忆压缩）
+            skills_dir: 技能目录路径（可选，默认 workspace/skills）
         """
         self.bus = bus
         self.provider = provider
@@ -92,6 +96,11 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = SessionManager(workspace)
         self.tools = ToolRegistry()
+
+        # 技能系统（对标 OpenClaw 的 skills/ 机制）
+        # 扫描 skills/ 目录，自动发现 Skill → 注册底层 Tool
+        skills_path = Path(skills_dir) if skills_dir else (workspace / "skills")
+        self.skill_manager = SkillManager(skills_path)
 
         # 记忆 Consolidation（已有）
         self.memory_consolidator = MemoryConsolidator(
@@ -121,6 +130,26 @@ class AgentLoop:
         # 注册默认工具
         self._register_default_tools()
 
+    async def initialize_skills(self) -> None:
+        """
+        初始化技能系统：扫描 skills/ 目录，发现并加载所有技能，
+        然后将技能下的 Tool 注册到 ToolRegistry。
+        """
+        try:
+            result = await self.skill_manager.discover()
+            if result.success_count > 0:
+                # 自动注册技能下的 Tool 到 ToolRegistry
+                count = self.skill_manager.register_all_tools(self.tools)
+                logger.info(
+                    f"[Skill] 技能初始化完成: {result.success_count} 个技能, "
+                    f"{count} 个工具注册"
+                )
+            if result.failed_count > 0:
+                for f in result.failed:
+                    logger.warning(f"[Skill] 技能加载失败: {f}")
+        except Exception as e:
+            logger.warning(f"[Skill] 技能系统初始化失败: {e}")
+
     def _register_default_tools(self) -> None:
         """注册 Agent 的默认工具集"""
         self.tools.register(ReadFileTool(workspace=self.workspace))
@@ -144,6 +173,7 @@ class AgentLoop:
         on_progress: Callable[..., Any] | None = None,
         on_stream: Callable[[str], Any] | None = None,
         on_stream_end: Callable[..., Any] | None = None,
+        skill_context: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """
         运行 Agent ReAct 循环。
@@ -164,11 +194,19 @@ class AgentLoop:
             on_progress: 进度回调（非流式模式下的文字进度）
             on_stream: 流式内容回调（每个文本块）
             on_stream_end: 流式结束回调（resuming=False = 最终回复）
+            skill_context: 技能上下文文本，注入到 system message
 
         Returns:
             (final_content, tools_used, all_messages)
         """
         messages = initial_messages
+
+        # 注入技能上下文到 system message
+        if skill_context:
+            for msg in messages:
+                if msg.get("role") == "system":
+                    msg["content"] = (msg["content"] or "") + "\n\n" + skill_context
+                    break
         iteration = 0
         final_content = None
         tools_used: list[str] = []
@@ -392,6 +430,9 @@ class AgentLoop:
         # 获取或创建 session
         session = self.sessions.get_or_create(msg.session_key)
 
+        # ── 技能匹配：根据用户意图匹配最相关的技能 ──
+        skill_context = await self._match_skills(msg.content)
+
         # 构建初始消息
         history = session.get_history(max_messages=0)
         initial_messages = self.context.build_messages(
@@ -402,9 +443,10 @@ class AgentLoop:
             chat_id=msg.chat_id,
         )
 
-        # 运行 ReAct 循环
+        # 运行 ReAct 循环（传入技能上下文）
         final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages,
+            skill_context=skill_context,
         )
 
         if final_content is None:
@@ -438,6 +480,40 @@ class AgentLoop:
             chat_id=msg.chat_id,
             content=final_content,
         )
+
+    # ─── 技能匹配 ────────────────────────────────
+
+    async def _match_skills(self, query: str) -> str | None:
+        """
+        根据用户查询匹配合适的技能，返回技能上下文文本。
+        
+        流程：
+          1. 调用 SkillManager.match() 获取 top-k 技能
+          2. 调用 compute_context() 生成 LLM 能理解的上下文文本
+          3. 将上下文注入到 system prompt 中
+        
+        如果没有匹配到任何技能，返回 None。
+        """
+        if self.skill_manager.count == 0:
+            return None
+
+        try:
+            matches = await self.skill_manager.match(query, top_k=3)
+            if not matches:
+                return None
+
+            context = self.skill_manager.compute_context(matches)
+            if context:
+                logger.info(
+                    f"[技能匹配] 命中 {len(matches)} 个技能: "
+                    + ", ".join(f"{m.skill.name}({m.score:.2f})" for m in matches)
+                )
+            return context
+        except Exception as e:
+            logger.warning(f"[技能匹配] 失败: {e}")
+            return None
+
+    # ─── 消息持久化 ────────────────────────────
 
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """

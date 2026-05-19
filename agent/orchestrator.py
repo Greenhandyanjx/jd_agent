@@ -35,14 +35,21 @@ class AgentOrchestrator:
     1. 初始化所有组件（总线、循环、Provider、工具）
     2. 提供同步/异步的 chat() 接口
     3. 管理工具注册
+    4. 管理技能系统（Skill 自动发现与注册）
     """
 
     _instance = None
 
-    def __init__(self, provider: LLMProvider | None = None, workspace: str | None = None):
+    def __init__(
+        self,
+        provider: LLMProvider | None = None,
+        workspace: str | None = None,
+        skills_dir: str | None = None,
+    ):
         self.bus = MessageBus()
         self.provider = provider
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
+        self.skills_dir = Path(skills_dir).expanduser().resolve() if skills_dir else None
         self.loop: AgentLoop | None = None
         self._task: asyncio.Task | None = None
 
@@ -53,13 +60,19 @@ class AgentOrchestrator:
         初始化 Agent 系统。
         
         必须先调用此方法才能使用 Agent。
+        初始化后，技能系统也会自动发现并注册。
         """
         self.loop = AgentLoop(
             bus=self.bus,
             provider=self.provider,
             workspace=self.workspace,
+            skills_dir=self.skills_dir,
         )
         self._task = asyncio.create_task(self.loop.run())
+
+        # 初始化技能系统：扫描 skills/ 目录，自动发现并注册 Skill
+        await self.loop.initialize_skills()
+
         logger.info("[Orchestrator] Agent 初始化完成")
 
     # ─── 同步接口 ──────────────────────────────
@@ -168,6 +181,26 @@ class AgentOrchestrator:
         """获取所有工具名称"""
         if self.loop:
             return self.loop.tools.tool_names
+        return []
+
+    # ─── 技能管理 ──────────────────────────────
+
+    def get_all_skills(self) -> list[dict]:
+        """获取所有已注册技能的字典表示"""
+        if self.loop:
+            return self.loop.skill_manager.to_dict()
+        return []
+
+    def get_skill_count(self) -> int:
+        """获取技能数量"""
+        if self.loop:
+            return self.loop.skill_manager.count
+        return 0
+
+    def get_skill_names(self) -> list[str]:
+        """获取所有技能名称"""
+        if self.loop:
+            return [s.name for s in self.loop.skill_manager.get_all()]
         return []
 
     # ─── 会话管理 ──────────────────────────────

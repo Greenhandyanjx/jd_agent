@@ -73,20 +73,26 @@ class Tool(ABC):
         required = []
         for name, schema in raw_params.items():
             if isinstance(schema, dict):
-                is_required = schema.pop("required", False)
+                is_required = schema.get("required", False)
                 if is_required:
                     required.append(name)
-            properties[name] = schema
+                # Remove inner "required" from property — only valid at top level
+                prop = {k: v for k, v in schema.items() if k != "required"}
+            else:
+                prop = schema
+            properties[name] = prop
+        parameters = {
+            "type": "object",
+            "properties": properties,
+        }
+        if required:
+            parameters["required"] = required
         return {
             "type": "function",
             "function": {
                 "name": self.name,
                 "description": self.description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": required,
-                },
+                "parameters": parameters,
             },
         }
 

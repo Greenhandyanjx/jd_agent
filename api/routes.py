@@ -52,6 +52,8 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str = "1.0.0"
     tools_count: int = 0
+    skills_count: int = 0
+    skills_names: list[str] = []
     sessions_count: int = 0
 
 
@@ -107,6 +109,10 @@ async def get_orchestrator() -> AgentOrchestrator:
         "JD_AGENT_WORKSPACE",
         str(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     )
+    skills_dir = os.environ.get(
+        "JD_AGENT_SKILLS_DIR",
+        os.path.join(workspace, "skills")
+    )
 
     if api_key:
         logger.info(f"[API] 使用 OpenAIProvider: model={model}, base={api_base}")
@@ -116,15 +122,19 @@ async def get_orchestrator() -> AgentOrchestrator:
         from agent.providers.tongyi_provider import TongyiProvider
         provider = TongyiProvider(model="qwen-plus")
 
-    # ── 2. 创建 Orchestrator ──
-    orchestrator = AgentOrchestrator(provider=provider, workspace=workspace)
+    # ── 2. 创建 Orchestrator（自动初始化技能系统）──
+    orchestrator = AgentOrchestrator(
+        provider=provider,
+        workspace=workspace,
+        skills_dir=skills_dir,  # 技能自动发现目录
+    )
     await orchestrator.initialize()
 
-    # ── 3. 注册工具 ──
+    # ── 3. 注册内置业务工具 ──
     registry = orchestrator.get_tool_registry()
     if registry is not None:
         register_all_tools(registry)
-        logger.info(f"[API] 已注册 {len(registry)} 个工具")
+        logger.info(f"[API] 已注册 {len(registry)} 个业务工具")
 
     _orchestrator = orchestrator
     logger.info("[API] AgentOrchestrator 初始化完成")
@@ -157,10 +167,19 @@ async def health_check():
             sessions_count = len(list(sessions_dir.glob("*.jsonl")))
     except Exception:
         pass
+    # 技能系统信息
+    skills_count = 0
+    skills_names = []
+    if orch.loop:
+        skills_count = orch.loop.skill_manager.count
+        skills_names = [s.name for s in orch.loop.skill_manager.get_all()]
+
     return HealthResponse(
         status="ok",
         version="1.0.0",
         tools_count=len(tools),
+        skills_count=skills_count,
+        skills_names=skills_names,
         sessions_count=sessions_count,
     )
 

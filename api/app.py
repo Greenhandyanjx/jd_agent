@@ -18,6 +18,7 @@ API 文档:
   GET  /api/v1/history    会话历史
 """
 import os
+from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI
@@ -25,6 +26,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
 
 from api.routes import router
+
+
+# ── Lifespan（替代弃用的 on_event） ────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """服务生命周期管理"""
+    logger.info("🚀 JD-Agent API 服务启动中...")
+    yield
+    # shutdown 逻辑
+    from api.routes import _orchestrator
+    if _orchestrator is not None:
+        try:
+            await _orchestrator.shutdown()
+            logger.info("[API] AgentOrchestrator 已关闭")
+        except Exception as e:
+            logger.warning(f"[API] 关闭 AgentOrchestrator 时出错: {e}")
+
 
 # ── 创建 FastAPI 应用 ────────────────────────────────────
 
@@ -40,6 +59,7 @@ app = FastAPI(
         "基于 ReAct 架构 · 参考 OpenClaw → nanobot 设计"
     ),
     version="1.0.0",
+    lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
 )
@@ -57,26 +77,6 @@ app.add_middleware(
 # ── 注册路由 ─────────────────────────────────────────
 
 app.include_router(router, prefix="/api/v1")
-
-
-# ── 启动事件 ─────────────────────────────────────────
-
-@app.on_event("startup")
-async def startup_event():
-    """服务启动时预热 AgentOrchestrator（不报错，首次请求时惰性初始化）"""
-    logger.info("🚀 JD-Agent API 服务启动中...")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """关闭时释放 Agent 资源"""
-    from api.routes import _orchestrator
-    if _orchestrator is not None:
-        try:
-            await _orchestrator.shutdown()
-            logger.info("[API] AgentOrchestrator 已关闭")
-        except Exception as e:
-            logger.warning(f"[API] 关闭 AgentOrchestrator 时出错: {e}")
 
 
 # ── 直接入口 ──────────────────────────────────────────
