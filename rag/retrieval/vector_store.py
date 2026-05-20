@@ -1,30 +1,52 @@
 """
-RAG Retrieval: 向量存储服务（迁移自原始项目）
+RAG Retrieval: 向量存储服务（FAISS 实现，替代原 ChromaDB）
 """
+import os
 from typing import Optional
-from langchain_chroma import Chroma
+
 from langchain_core.documents import Document
+from langchain_core.retrievers import BaseRetriever
+from langchain_community.vectorstores import FAISS
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from utils.config import chroma_conf
 from model.factory import embed_model
 from utils.path_tool import get_abs_path
 from utils.file_handler import pdf_loader, txt_loader, listdir_with_allowed_type, get_file_md5_hex
 from utils.logger import logger
-import os
+
+
+class _EmptyRetriever(BaseRetriever):
+    """当向量索引不存在时返回空结果的兜底检索器。"""
+    def _get_relevant_documents(self, query: str, **kwargs):
+        return []
 
 
 class VectorStoreService:
-    """向量存储服务"""
+    """向量存储服务（基于 FAISS）"""
 
     def __init__(self):
-        persist_dir = get_abs_path(chroma_conf.get("persist_directory", "db/chroma_db"))
-        os.makedirs(persist_dir, exist_ok=True)
+        raw_dir = chroma_conf.get("persist_directory", "db/faiss_index")
+        abs_dir = os.path.normpath(get_abs_path(raw_dir))
+        os.makedirs(abs_dir, exist_ok=True)
+        # FAISS C++ fopen 无法处理含中文的绝对路径（Windows），
+        # 使用 relpath 确保传递给 FAISS 的是 ASCII 路径。
+        self.persist_dir = os.path.relpath(abs_dir)
 
-        self.vector_store = Chroma(
-            collection_name=chroma_conf.get("collection_name", "agent"),
-            embedding_function=embed_model,
-            persist_directory=persist_dir,
-        )
+        self.vector_store: Optional[FAISS] = None
+        try:
+            index_file = os.path.join(self.persist_dir, "index.faiss")
+            if os.path.exists(index_file):
+                self.vector_store = FAISS.load_local(
+                    self.persist_dir,
+                    embed_model,
+                    allow_dangerous_deserialization=True,
+                )
+                logger.info(f"[VectorStore] 加载 FAISS 索引: {self.persist_dir}")
+        except Exception as e:
+            logger.warning(f"[VectorStore] 加载 FAISS 索引失败（将新建）: {e}")
+            self.vector_store = None
+
         self.spliter = RecursiveCharacterTextSplitter(
             chunk_size=chroma_conf.get("chunk_size", 200),
             chunk_overlap=chroma_conf.get("chunk_overlap", 20),
@@ -33,9 +55,22 @@ class VectorStoreService:
         )
 
     def get_retriever(self):
+        if self.vector_store is None:
+            return _EmptyRetriever()
         return self.vector_store.as_retriever(
             search_kwargs={"k": chroma_conf.get("k", 3)}
         )
+
+    def get_all_documents(self) -> list[Document]:
+        """获取索引中所有文档（用于 BM25 同步等场景）"""
+        if self.vector_store is None:
+            return []
+        return list(self.vector_store.docstore._dict.values())
+
+    def _save(self):
+        """持久化 FAISS 索引到磁盘"""
+        if self.vector_store is not None:
+            self.vector_store.save_local(self.persist_dir)
 
     def load_document(self):
         """加载知识库文档到向量存储"""
@@ -76,7 +111,11 @@ class VectorStoreService:
 
                 split_docs = self.spliter.split_documents(documents)
                 if split_docs:
-                    self.vector_store.add_documents(split_docs)
+                    if self.vector_store is None:
+                        self.vector_store = FAISS.from_documents(split_docs, embed_model)
+                    else:
+                        self.vector_store.add_documents(split_docs)
+                    self._save()
                     save_md5(md5_hex)
                     logger.info(f"[VectorStore] 加载知识库: {path}")
             except Exception as e:

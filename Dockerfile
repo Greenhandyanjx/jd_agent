@@ -22,10 +22,9 @@ FROM python:3.10-slim AS builder
 
 WORKDIR /app
 
-# 安装编译依赖（chromadb 等需要）
+# 安装编译依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
-    g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # 只复制依赖文件提前构建缓存层

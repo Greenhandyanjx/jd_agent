@@ -23,7 +23,18 @@
       "Bash(curl -s -X POST \"http://127.0.0.1:8000/api/v1/chat\" -H \"Content-Type: application/json\" -d @/tmp/weather.json --max-time 120)",
       "Bash(taskkill /PID 31572 /F)",
       "Bash(powershell -Command \"Get-Process -Id \\(Get-NetTCPConnection -LocalPort 8000\\).OwningProcess | Stop-Process -Force\")",
-      "Bash(powershell -Command \"taskkill /PID 6232 /F\")"
+      "Bash(powershell -Command \"taskkill /PID 6232 /F\")",
+      "Bash(python -c \"from langchain_community.vectorstores import FAISS; print\\('FAISS available'\\)\")",
+      "Bash(python scripts/migrate_to_faiss.py)",
+      "Bash(pip install *)",
+      "Bash(printf '{\"message\":\"用RAG搜索知识库中的内容\",\"stream\":false}')",
+      "Bash(curl -s -X POST \"http://127.0.0.1:8000/api/v1/chat\" -H \"Content-Type: application/json\" -d @/tmp/rag_test.json --max-time 120)",
+      "Bash(rm -rf db/faiss_index)",
+      "Bash(grep -i \"faiss\\\\|vector\\\\|LongTermMemory\" /tmp/api_faiss.log 2>/dev/null || echo \"no matching log lines\")",
+      "Read(//tmp/**)",
+      "Bash(printf '{\"message\":\"用RAG查一下扫地机器人的安装方法\",\"stream\":false}')",
+      "Bash(curl -s -X POST \"http://127.0.0.1:8000/api/v1/chat\" -H \"Content-Type: application/json\" -d @/tmp/rag_test2.json --max-time 120)",
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
     ]
   }
 }

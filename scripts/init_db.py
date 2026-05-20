@@ -22,7 +22,7 @@ def init_knowledge_base():
 def init_environment():
     """初始化环境"""
     # 创建必要的目录
-    dirs = ["db/chroma_db", "logs", "data/external"]
+    dirs = ["db/faiss_index", "logs", "data/external"]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
     logger.info("[Init] 目录初始化完成")

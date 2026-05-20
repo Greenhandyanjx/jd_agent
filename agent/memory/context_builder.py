@@ -107,13 +107,20 @@ class ContextBuilder:
 
     def _get_identity(self) -> str:
         """构建核心身份部分"""
+        from datetime import datetime
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{system} {platform.machine()}, Python {platform.python_version()}"
+        now = datetime.now()
+        current_time = now.strftime("%Y-%m-%d %H:%M:%S")
+        weekday = ["星期一", "星期二", "星期三", "星期四", "星期五", "星期六", "星期日"][now.weekday()]
 
         return f"""# JD-Agent 🤖
 
 你是一个智能 AI 助手，基于 ReAct (Reasoning + Acting) 架构开发。
+
+## 当前时间
+{current_time} {weekday}
 
 ## 运行时
 {runtime}

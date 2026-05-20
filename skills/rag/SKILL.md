@@ -7,7 +7,7 @@ metadata:
   openclaw:
     emoji: "📚"
     requires:
-      python: ["chromadb", "sentence-transformers"]
+      python: ["faiss-cpu", "sentence-transformers"]
 ---
 
 # RAG Skill
@@ -40,7 +40,7 @@ metadata:
 - `query` (string, 必填): 检索查询字符串
 
 **检索方式：**
-- 向量检索（ChromaDB + Sentence Embedding）
+- 向量检索（FAISS + Sentence Embedding）
 - BM25 关键词检索
 - RRF 融合排序
 - Reranker 重排序

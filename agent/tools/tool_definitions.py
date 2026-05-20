@@ -30,9 +30,6 @@ _rag = RagRetrievalService()
 
 # Mock 数据
 CITIES = ["北京", "上海", "广州", "深圳", "杭州", "成都", "武汉"]
-MONTH_ARR = ["2025-01", "2025-02", "2025-03", "2025-04", "2025-05",
-             "2025-06", "2025-07", "2025-08", "2025-09", "2025-10",
-             "2025-11", "2025-12"]
 USER_IDS = ["1001", "1002", "1003", "1004", "1005"]
 
 
@@ -75,33 +72,6 @@ class RAGQueryTool(Tool):
         """检索知识库，返回原始文档内容（不生成回答）"""
         return _rag.retrieve(query)
 
-
-class WeatherTool(Tool):
-    """天气查询"""
-
-    @property
-    def name(self) -> str:
-        return "get_weather"
-
-    @property
-    def description(self) -> str:
-        return "获取指定城市的天气信息，返回天气、温度、湿度等"
-
-    @property
-    def parameters(self) -> dict[str, Any]:
-        return {
-            "city": {
-                "type": "string",
-                "description": "城市名称",
-                "required": True,
-            },
-        }
-
-    async def execute(self, city: str, **kwargs: Any) -> str:
-        weathers = ["晴朗", "多云", "小雨", "阴天", "晴转多云"]
-        temps = [22, 26, 28, 30, 18, 20, 24]
-        return (f"{city}今日天气：{random.choice(weathers)}，"
-                f"气温{random.choice(temps)}°C，湿度{random.randint(40, 80)}%")
 
 
 class UserLocationTool(Tool):
@@ -158,7 +128,8 @@ class CurrentMonthTool(Tool):
         return {}
 
     async def execute(self, **kwargs: Any) -> str:
-        return random.choice(MONTH_ARR)
+        from datetime import datetime
+        return datetime.now().strftime("%Y-%m")
 
 
 class OrderQueryTool(Tool):
@@ -263,7 +234,6 @@ def register_all_tools(registry) -> None:
     """
     tools = [
         RAGQueryTool(),
-        WeatherTool(),
         UserLocationTool(),
         UserIDTool(),
         CurrentMonthTool(),

@@ -230,9 +230,9 @@ class RagRetrievalService:
         
         if self.hybrid_retriever:
             try:
-                all_docs = self.vector_store.vector_store.get()
-                if all_docs and "documents" in all_docs:
-                    texts = [str(d) for d in all_docs["documents"]]
+                all_docs = self.vector_store.get_all_documents()
+                if all_docs:
+                    texts = [doc.page_content for doc in all_docs]
                     self.hybrid_retriever.bm25_retriever.add_documents(texts)
                     logger.info(f"[RAG] BM25 索引已更新: {len(texts)} 篇")
             except Exception as e:

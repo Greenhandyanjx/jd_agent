@@ -1,13 +1,18 @@
 """
 Memory: 长期记忆
-持久化跨会话的记忆，使用向量数据库进行语义检索
+持久化跨会话的记忆，使用 FAISS 进行语义检索（替代原 ChromaDB）
 """
 import json
+import os
 from typing import Optional
 from datetime import datetime
+
+from langchain_core.documents import Document
+from langchain_community.vectorstores import FAISS
+
 from utils.logger import logger
 from utils.config import chroma_conf
-from langchain_chroma import Chroma
+from utils.path_tool import get_abs_path
 from model.factory import embed_model
 
 
@@ -20,16 +25,34 @@ class LongTermMemory:
 
     def __init__(self, collection_name: str = "long_term_memory"):
         self.collection_name = collection_name
+        raw_dir = chroma_conf.get("persist_directory", "db/faiss_index")
+        abs_dir = os.path.normpath(get_abs_path(raw_dir))
+        os.makedirs(abs_dir, exist_ok=True)
+        # FAISS C++ fopen 无法处理含中文的绝对路径（Windows），
+        # 使用 relpath 确保传递给 FAISS 的是 ASCII 路径。
+        self.persist_dir = os.path.join(os.path.relpath(abs_dir), collection_name)
+        os.makedirs(self.persist_dir, exist_ok=True)
+
+        self.vector_store: Optional[FAISS] = None
         try:
-            self.vector_store = Chroma(
-                collection_name=collection_name,
-                embedding_function=embed_model,
-                persist_directory=chroma_conf.get("persist_directory", "db/chroma_db"),
-            )
-            logger.info(f"[LongTermMemory] 初始化长期记忆存储: {collection_name}")
+            index_file = os.path.join(self.persist_dir, "index.faiss")
+            if os.path.exists(index_file):
+                self.vector_store = FAISS.load_local(
+                    self.persist_dir,
+                    embed_model,
+                    allow_dangerous_deserialization=True,
+                )
+                logger.info(f"[LongTermMemory] 加载 FAISS 索引: {self.persist_dir}")
+            else:
+                logger.info(f"[LongTermMemory] 初始化空存储: {collection_name}")
         except Exception as e:
             logger.warning(f"[LongTermMemory] 初始化失败（可能是首次使用）: {e}")
             self.vector_store = None
+
+    def _save(self):
+        """持久化 FAISS 索引到磁盘"""
+        if self.vector_store is not None:
+            self.vector_store.save_local(self.persist_dir)
 
     def remember(self, key: str, content: str, metadata: Optional[dict] = None) -> bool:
         """
@@ -38,18 +61,17 @@ class LongTermMemory:
         content: 记忆内容
         metadata: 附加元数据（如时间、来源等）
         """
-        if self.vector_store is None:
-            logger.warning("[LongTermMemory] 存储未初始化，无法保存")
-            return False
-
         try:
             meta = metadata or {}
             meta["key"] = key
             meta["timestamp"] = datetime.now().isoformat()
 
-            from langchain_core.documents import Document
             doc = Document(page_content=content, metadata=meta)
-            self.vector_store.add_documents([doc])
+            if self.vector_store is None:
+                self.vector_store = FAISS.from_documents([doc], embed_model)
+            else:
+                self.vector_store.add_documents([doc])
+            self._save()
             logger.info(f"[LongTermMemory] 记住: {key}")
             return True
         except Exception as e:
@@ -80,13 +102,27 @@ class LongTermMemory:
 
     def forget(self, key: str) -> bool:
         """
-        忘记一条信息（根据key删除）
+        忘记一条信息（FAISS 不支持单条删除，重新构建索引）
         """
         if self.vector_store is None:
             return False
         try:
-            # Chroma 通过 metadata 中的 key 来过滤删除
-            self.vector_store.delete(filter={"key": key})
+            all_docs = list(self.vector_store.docstore._dict.values())
+            kept_docs = [doc for doc in all_docs if doc.metadata.get("key") != key]
+
+            if len(kept_docs) == len(all_docs):
+                logger.info(f"[LongTermMemory] 未找到 key={key}，无需删除")
+                return False
+
+            if kept_docs:
+                self.vector_store = FAISS.from_documents(kept_docs, embed_model)
+            else:
+                self.vector_store = None
+                # 清空持久化文件
+                for f in os.listdir(self.persist_dir):
+                    os.remove(os.path.join(self.persist_dir, f))
+
+            self._save() if kept_docs else None
             logger.info(f"[LongTermMemory] 遗忘: {key}")
             return True
         except Exception as e:
@@ -98,7 +134,8 @@ class LongTermMemory:
         if self.vector_store is None:
             return {"status": "uninitialized", "count": 0}
         try:
-            count = len(self.vector_store.get()["ids"])
+            count = self.vector_store.index.ntotal
             return {"status": "ready", "count": count}
-        except:
+        except Exception as e:
+            logger.error(f"[LongTermMemory] 获取统计失败: {e}")
             return {"status": "error", "count": 0}
