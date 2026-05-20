@@ -98,6 +98,15 @@ class Dream:
 
     # ─── 公开接口 ───────────────────────────────────────
 
+    def pending_count(self) -> int:
+        """返回未处理的 consolidation 条目数"""
+        last_cursor = self.history_jsonl.get_last_dream_cursor()
+        entries = self.history_jsonl.read_since_cursor(last_cursor)
+        return len([
+            e for e in entries
+            if e.get("type") == "consolidation" and e.get("summary")
+        ])
+
     def run(self) -> dict[str, Any]:
         """执行一轮 Dream 处理。
 

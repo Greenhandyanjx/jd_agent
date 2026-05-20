@@ -31,27 +31,6 @@ if TYPE_CHECKING:
     from agent.session.manager import Session, SessionManager
 
 
-# ─── MemoryConsolidator 使用的 LLM Tool 定义 ─────
-# 这是一个"假的" tool 定义，实际上我们不调用 tool，
-# 而是让 LLM 直接返回我们需要的 JSON 格式
-
-_MEMORY_SAVE_PROMPT = """## 记忆系统指令
-
-请根据当前对话内容，更新记忆文件。
-请以 JSON 格式返回以下两个字段（不要包含其他内容）：
-
-```json
-{
-  "history_entry": "[YYYY-MM-DD HH:MM] 一段描述本次对话关键事件/决策的段落...",
-  "memory_update": "完整的更新后的 long-term memory（Markdown 格式）..."
-}
-```
-
-- history_entry: 添加到 HISTORY.md 的一条可 grep 搜索的摘要
-- memory_update: 完整的 MEMORY.md 内容（包含所有已有事实 + 新学习到的信息）
-"""
-
-
 class MemoryStore:
     """
     Memory 文件存储层。
@@ -223,13 +202,15 @@ class MemoryConsolidator:
         if new_count == 0:
             return
 
-        # 按消息数检查
-        hit_count = new_count >= self._consolidate_every_n
-
-        # 按时间检查
+        # 双阈值：消息数达到阈值，或时间达标且有一定量的新消息
         now = datetime.now().timestamp()
         time_since_last = now - self._last_consolidation_time
-        hit_time = time_since_last >= self._consolidate_interval_min * 60
+
+        hit_count = new_count >= self._consolidate_every_n
+        hit_time = (
+            time_since_last >= self._consolidate_interval_min * 60
+            and new_count >= min(5, self._consolidate_every_n // 2)
+        )
 
         if not hit_count and not hit_time:
             return
@@ -247,8 +228,8 @@ class MemoryConsolidator:
         
         流程：
         1. 获取未 consolidated 的对话历史
-        2. 用 LLM 分析对话并生成 history_entry + memory_update
-        3. 写入 HISTORY.md 和 MEMORY.md
+        2. 用 LLM 分析对话生成 history_entry 摘要
+        3. 写入 history.jsonl 和 HISTORY.md
         4. 更新 session 的 last_consolidated 指针
         """
         # 获取未 consolidated 的历史
@@ -256,29 +237,34 @@ class MemoryConsolidator:
         if not unconsolidated:
             return
 
-        # 读取当前的 MEMORY.md 以获得上下文
-        current_memory = self.memory.read_long_term()
-
         # 构建 consolidation prompt
+        now = datetime.now()
+        date_str = now.strftime("%Y-%m-%d %H:%M")
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "你是一个记忆管理系统。请分析以下对话历史，提取关键信息。"
+                    f"当前日期时间：{date_str}\n\n"
+                    "你是一个对话日志系统。请分析以下对话历史，用一句话概括关键内容。"
                     "返回 JSON 格式：\n\n"
-                    '{"history_entry": "时间戳 摘要", "memory_update": "完整记忆文件"}'
+                    '{\n'
+                    '  "history_entry": "当前日期 YYYY-MM-DD HH:MM:SS 摘要"\n'
+                    '}\n\n'
+                    f"history_entry 必须以「{now.strftime('%Y-%m-%d')} 」开头，"
+                    "不要使用其他日期！"
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"## 当前长期记忆\n{current_memory or '（空）'}\n\n"
+                    f"## 当前日期\n{now.strftime('%Y年%m月%d日 %H:%M')}\n\n"
                     f"## 这段对话历史（共 {len(unconsolidated)} 条消息）\n"
                     + json.dumps([
                         {"role": m["role"], "content": str(m.get("content", ""))[:500]}
                         for m in unconsolidated[-10:]  # 只取最近 10 条，避免 token 爆炸
                     ], ensure_ascii=False, indent=2)
-                    + "\n\n请返回 JSON 格式的 history_entry 和 memory_update。"
+                    + "\n\n请返回 JSON 格式的 history_entry。"
+                    f"\n\n重要：history_entry 必须以「{now.strftime('%Y-%m-%d')} 」开头，不要使用其他日期！"
                 ),
             },
         ]
@@ -292,27 +278,20 @@ class MemoryConsolidator:
             )
 
             if response.content:
-                result = self._parse_consolidation_result(response.content)
-                if result:
-                    history_entry, memory_update = result
+                history_entry = self._parse_consolidation_result(response.content)
+                if history_entry:
                     # 写入 HISTORY.md
-                    if history_entry:
-                        self.memory.append_history(history_entry)
-                    # 同时写入 history.jsonl
-                    if history_entry:
-                        self.memory.history_jsonl.append({
-                            "type": "consolidation",
-                            "session_key": session.key,
-                            "summary": history_entry,
-                            "memory_update": memory_update or "",
-                            "message_count": len(unconsolidated),
-                            "cursor": len(session.messages),
-                            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
-                        })
-                        self.memory.history_jsonl.compact()
-                    # 更新 MEMORY.md
-                    if memory_update:
-                        self.memory.write_long_term(memory_update)
+                    self.memory.append_history(history_entry)
+                    # 写入 history.jsonl（Dream 的素材）
+                    self.memory.history_jsonl.append({
+                        "type": "consolidation",
+                        "session_key": session.key,
+                        "summary": history_entry,
+                        "message_count": len(unconsolidated),
+                        "cursor": len(session.messages),
+                        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                    })
+                    self.memory.history_jsonl.compact()
                     # 更新 session 指针
                     session.last_consolidated = len(session.messages)
                     logger.info("记忆 consolidation 完成")
@@ -320,15 +299,14 @@ class MemoryConsolidator:
             logger.error(f"记忆 consolidation 失败: {e}")
 
     @staticmethod
-    def _parse_consolidation_result(content: str) -> tuple[str, str] | None:
-        """解析 LLM 返回的 consolidation 结果"""
-        # 尝试提取 JSON
+    def _parse_consolidation_result(content: str) -> str | None:
+        """解析 LLM 返回的 consolidation 结果，提取 history_entry"""
         import re
-        json_match = re.search(r'\{[^{}]*"history_entry"[^{}]*"memory_update"[^{}]*\}', content)
+        json_match = re.search(r'\{[^{}]*"history_entry"[^{}]*\}', content)
         if json_match:
             try:
                 data = json.loads(json_match.group())
-                return data.get("history_entry", ""), data.get("memory_update", "")
+                return data.get("history_entry", "").strip() or None
             except (json.JSONDecodeError, KeyError):
                 pass
         return None

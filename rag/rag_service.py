@@ -94,6 +94,9 @@ class RagRetrievalService:
         self.hybrid_retriever = HybridRetriever(enable_multi_query=multi_query) if enable_optimization else None
         self.enable_optimization = enable_optimization
 
+        # 启动时初始化 BM25 索引（确保双路召回生效）
+        self._init_bm25_index()
+
     # ─── 核心检索 ────────────────────────────
 
     def retrieve(self, query: str, k: int = 5) -> str:
@@ -237,3 +240,16 @@ class RagRetrievalService:
                     logger.info(f"[RAG] BM25 索引已更新: {len(texts)} 篇")
             except Exception as e:
                 logger.warning(f"[RAG] BM25 索引更新失败: {e}")
+
+    def _init_bm25_index(self) -> None:
+        """初始化 BM25 索引（启动时调用，确保双路召回生效）"""
+        if not self.hybrid_retriever:
+            return
+        try:
+            all_docs = self.vector_store.get_all_documents()
+            if all_docs:
+                texts = [doc.page_content for doc in all_docs]
+                self.hybrid_retriever.bm25_retriever.add_documents(texts)
+                logger.info(f"[RAG] BM25 索引初始化完成: {len(texts)} 篇")
+        except Exception as e:
+            logger.warning(f"[RAG] BM25 索引初始化失败（首次使用无数据）: {e}")

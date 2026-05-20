@@ -34,7 +34,9 @@
       "Read(//tmp/**)",
       "Bash(printf '{\"message\":\"用RAG查一下扫地机器人的安装方法\",\"stream\":false}')",
       "Bash(curl -s -X POST \"http://127.0.0.1:8000/api/v1/chat\" -H \"Content-Type: application/json\" -d @/tmp/rag_test2.json --max-time 120)",
-      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)"
+      "Bash(PYTHONIOENCODING=utf-8 python -c ' *)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/eval_rag.py --k 3 5 -v)",
+      "Bash(PYTHONIOENCODING=utf-8 python scripts/eval_rag.py --k 3 5 10 --output eval_report.md)"
     ]
   }
 }

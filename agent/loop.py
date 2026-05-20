@@ -459,18 +459,14 @@ class AgentLoop:
         # 触发记忆 consolidation
         await self.memory_consolidator.maybe_consolidate(session)
 
-        # 触发 Dream 归档（每 5 轮 consolidation 一次）
-        if not hasattr(self, '_dream_tick'):
-            self._dream_tick = 0
-        self._dream_tick += 1
-        if self._dream_tick >= 5:
-            self._dream_tick = 0
-            try:
+        # 触发 Dream 归档（积攒至少 3 条未处理的 consolidation 时执行）
+        try:
+            if self.dream.pending_count() >= 3:
                 dream_result = self.chat_memory.run_dream()
                 if dream_result.get('added', 0) > 0 or dream_result.get('replaced', 0) > 0:
                     logger.info(f"[Dream] 归档完成: {dream_result}")
-            except Exception as exc:
-                logger.warning(f"[Dream] 归档失败: {exc}")
+        except Exception as exc:
+            logger.warning(f"[Dream] 归档失败: {exc}")
 
         preview_rsp = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"[Agent] 回复 {msg.channel}:{msg.sender_id}: {preview_rsp}")
