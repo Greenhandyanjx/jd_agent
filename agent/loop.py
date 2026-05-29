@@ -173,7 +173,6 @@ class AgentLoop:
         on_progress: Callable[..., Any] | None = None,
         on_stream: Callable[[str], Any] | None = None,
         on_stream_end: Callable[..., Any] | None = None,
-        skill_context: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """
         运行 Agent ReAct 循环。
@@ -190,23 +189,15 @@ class AgentLoop:
                 a. 作为最终回复返回
 
         Args:
-            initial_messages: 初始消息列表（system + history + user）
+            initial_messages: 初始消息列表（system + history + user，已含所有上下文）
             on_progress: 进度回调（非流式模式下的文字进度）
             on_stream: 流式内容回调（每个文本块）
             on_stream_end: 流式结束回调（resuming=False = 最终回复）
-            skill_context: 技能上下文文本，注入到 system message
 
         Returns:
             (final_content, tools_used, all_messages)
         """
         messages = initial_messages
-
-        # 注入技能上下文到 system message
-        if skill_context:
-            for msg in messages:
-                if msg.get("role") == "system":
-                    msg["content"] = (msg["content"] or "") + "\n\n" + skill_context
-                    break
         iteration = 0
         final_content = None
         tools_used: list[str] = []
@@ -321,7 +312,8 @@ class AgentLoop:
         thinking_blocks: list[dict] | None = None,
     ) -> list[dict]:
         """添加 assistant 消息到消息列表"""
-        msg = {"role": "assistant", "content": content}
+        # 确保 content 不会是 None → 某些 LLM API 将 null content 渲染为 "None"
+        msg = {"role": "assistant", "content": content or ""}
         if tool_call_dicts:
             msg["tool_calls"] = tool_call_dicts
         if reasoning_content:
@@ -414,15 +406,16 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """
         处理单条入站消息。
-        
+
         完整流程：
         1. 获取或创建 session
-        2. 加载历史消息
-        3. 构建消息列表
+        2. 加载历史消息（最近 30 条未 consolidated 的消息）
+        3. 构建消息列表（ContextBuilder 统管身份 + 长期记忆 + 中期记忆）
         4. 运行 ReAct 循环
         5. 持久化新消息
         6. 触发记忆 consolidation
-        7. 返回出站消息
+        7. 截断已 consolidated 的消息（内存有界）
+        8. 返回出站消息
         """
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"[Agent] 处理来自 {msg.channel}:{msg.sender_id} 的消息: {preview}")
@@ -433,20 +426,21 @@ class AgentLoop:
         # ── 技能匹配：根据用户意图匹配最相关的技能 ──
         skill_context = await self._match_skills(msg.content)
 
-        # 构建初始消息
-        history = session.get_history(max_messages=0)
+        # 构建初始消息（ContextBuilder 统管身份 + 长期记忆 + 中期记忆 + 技能上下文）
+        history = session.get_history(max_messages=30)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel,
             chat_id=msg.chat_id,
+            chat_memory=self.chat_memory,  # 注入中期记忆摘要
+            skill_context=skill_context,   # 注入技能上下文
         )
 
-        # 运行 ReAct 循环（传入技能上下文）
+        # 运行 ReAct 循环
         final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages,
-            skill_context=skill_context,
         )
 
         if final_content is None:
@@ -458,6 +452,12 @@ class AgentLoop:
 
         # 触发记忆 consolidation
         await self.memory_consolidator.maybe_consolidate(session)
+
+        # 截断已 consolidated 的消息（数据已持久化到 JSONL + history.jsonl）
+        if session.last_consolidated > 0:
+            session.messages[:session.last_consolidated] = []
+            session.last_consolidated = 0
+            self.sessions.save(session)
 
         # 触发 Dream 归档（积攒至少 3 条未处理的 consolidation 时执行）
         try:

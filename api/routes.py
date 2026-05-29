@@ -255,7 +255,7 @@ async def chat(request: ChatRequest):
 
 # ─── History ─────────────────────────────────────────────
 
-@router.get("/history", response_model=HistoryResponse)
+@router.get("/history", response_model=HistoryResponse, response_model_exclude_none=True)
 async def get_history(session_key: Optional[str] = Query(None, description="会话标识")):
     """
     GET /api/v1/history — 获取会话历史
@@ -272,13 +272,14 @@ async def get_history(session_key: Optional[str] = Query(None, description="会�
         session = orch.loop.sessions.get_or_create(key)
         history = session.get_history(max_messages=200)
         # 过滤敏感字段，只保留 role / content / tool_calls
+        # 同时跳过工具调用专用的 assistant 消息（content 空 + 有 tool_calls）
         cleaned = []
         for msg in history:
+            if msg.get("role") == "assistant" and not msg.get("content") and msg.get("tool_calls"):
+                continue
             entry = {"role": msg.get("role", "")}
             if msg.get("content"):
                 entry["content"] = msg["content"]
-            if msg.get("tool_calls"):
-                entry["tool_calls"] = msg["tool_calls"]
             cleaned.append(entry)
         return HistoryResponse(history=cleaned, total=len(cleaned))
     except Exception as e:

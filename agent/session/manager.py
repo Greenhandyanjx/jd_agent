@@ -119,6 +119,11 @@ class Session:
         if start:
             sliced = sliced[start:]
 
+        # 确保 content 字段不会是 None（旧数据兼容 + 防止 LLM 将 null 渲染为 "None"）
+        for msg in sliced:
+            if msg.get("content") is None:
+                msg["content"] = ""
+
         return sliced
 
     def clear(self) -> None:

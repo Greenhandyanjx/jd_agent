@@ -122,16 +122,14 @@ class TaskPlanner:
 
     def _parse_plan_response(self, response: str) -> list[Task]:
         """解析LLM返回的任务计划"""
-        import json
-        import re
+        from agent.utils.json_parser import extract_json
 
-        # 尝试提取 JSON
-        json_match = re.search(r'\{[\s\S]*"tasks"[\s\S]*\}', response)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
+        data = extract_json(response)
+        if data and isinstance(data, dict):
+            tasks_data = data.get("tasks", [])
+            if tasks_data:
                 tasks = []
-                for t_data in data.get("tasks", []):
+                for t_data in tasks_data:
                     task = Task(
                         task_id=t_data.get("task_id", f"task_{len(tasks)+1}"),
                         name=t_data.get("name", "未知任务"),
@@ -142,8 +140,6 @@ class TaskPlanner:
                     tasks.append(task)
                     self.tasks[task.task_id] = task
                 return tasks
-            except json.JSONDecodeError:
-                pass
 
         # fallback: 返回一个兜底任务
         return [Task("task_1", "处理用户请求", response)]

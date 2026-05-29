@@ -260,7 +260,7 @@ class MemoryConsolidator:
                     f"## 当前日期\n{now.strftime('%Y年%m月%d日 %H:%M')}\n\n"
                     f"## 这段对话历史（共 {len(unconsolidated)} 条消息）\n"
                     + json.dumps([
-                        {"role": m["role"], "content": str(m.get("content", ""))[:500]}
+                        {"role": m["role"], "content": (m.get("content") or "")[:500]}
                         for m in unconsolidated[-10:]  # 只取最近 10 条，避免 token 爆炸
                     ], ensure_ascii=False, indent=2)
                     + "\n\n请返回 JSON 格式的 history_entry。"
@@ -301,12 +301,10 @@ class MemoryConsolidator:
     @staticmethod
     def _parse_consolidation_result(content: str) -> str | None:
         """解析 LLM 返回的 consolidation 结果，提取 history_entry"""
-        import re
-        json_match = re.search(r'\{[^{}]*"history_entry"[^{}]*\}', content)
-        if json_match:
-            try:
-                data = json.loads(json_match.group())
-                return data.get("history_entry", "").strip() or None
-            except (json.JSONDecodeError, KeyError):
-                pass
+        from agent.utils.json_parser import extract_json
+
+        data = extract_json(content)
+        if data and isinstance(data, dict):
+            entry = data.get("history_entry", "")
+            return entry.strip() if entry else None
         return None

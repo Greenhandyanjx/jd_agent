@@ -11,18 +11,22 @@ Agent Core: 上下文构建器
 
 import platform
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from agent.memory.memory_store import MemoryStore
+
+if TYPE_CHECKING:
+    from agent.memory.chat_memory import ChatMemory
 
 
 class ContextBuilder:
     """
     上下文构建器。
-    
+
     每个组成部分都会拼成 System Prompt 的一部分：
     - 身份信息（AGENTS.md / SOUL.md / USER.md / TOOLS.md）
     - 长期记忆（MEMORY.md）
+    - 中期记忆（history.jsonl 摘要，通过 chat_memory 参数注入）
     - 技能描述（skills/SKILL.md）
     """
 
@@ -64,21 +68,42 @@ class ContextBuilder:
         media: list[str] | None = None,
         channel: str = "cli",
         chat_id: str = "direct",
+        chat_memory: "ChatMemory | None" = None,
+        skill_context: str | None = None,
     ) -> list[dict[str, Any]]:
         """
         构建发送给 LLM 的完整消息列表。
-        
+
         返回：[system_prompt] + [历史消息] + [当前用户消息]
-        
+
+        system_prompt 按顺序组装：
+        1. 核心身份 + 运行时信息
+        2. Workspace 文件（AGENTS.md 等）
+        3. 长期记忆（MEMORY.md）
+        4. 中期记忆（history.jsonl 摘要，传入 chat_memory 时生效）
+        5. 技能上下文（传入 skill_context 时生效）
+
         参数：
             history: Session 中的历史消息
             current_message: 用户当前输入
             media: 用户附带的媒体文件
             channel: 来源通道
             chat_id: 会话ID
+            chat_memory: 传入后自动注入中期记忆摘要到 system prompt
+            skill_context: 传入后自动注入技能上下文到 system prompt
         """
         # 构建 system prompt
         system_prompt = self.build_system_prompt()
+
+        # 注入中期记忆（history.jsonl 摘要）
+        if chat_memory:
+            medium_term = self._build_medium_term(chat_memory)
+            if medium_term:
+                system_prompt += "\n\n" + medium_term
+
+        # 注入技能上下文
+        if skill_context:
+            system_prompt += "\n\n" + skill_context
 
         # 如果有 media 信息，追加到 system prompt
         if media:
@@ -104,6 +129,21 @@ class ContextBuilder:
             messages.append({"role": "user", "content": user_content})
 
         return messages
+
+    def _build_medium_term(self, chat_memory: "ChatMemory", max_entries: int = 5) -> str:
+        """构建中期记忆上下文（从 history.jsonl 读取最近 N 条摘要）。"""
+        entries = chat_memory.history_jsonl.read_all()
+        if not entries:
+            return ""
+        recent = entries[-max_entries:]
+        summary_lines = []
+        for i, e in enumerate(recent, 1):
+            summary = e.get("summary", "")
+            if summary:
+                summary_lines.append(f"## 历史阶段 {i}\n{summary[:200]}")
+        if not summary_lines:
+            return ""
+        return "# 对话历史摘要\n\n" + "\n\n".join(summary_lines)
 
     def _get_identity(self) -> str:
         """构建核心身份部分"""

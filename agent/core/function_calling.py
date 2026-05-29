@@ -67,6 +67,14 @@ def parse_function_call(model_response: str) -> Optional[FunctionCall]:
         if result:
             return result
 
+    # 方法5: 统一 fallback — 用 extract_json 的完整回退链提取
+    from agent.utils.json_parser import extract_json
+    data = extract_json(text)
+    if isinstance(data, dict):
+        result = _try_parse_json(json.dumps(data, ensure_ascii=False), is_tool_call=True)
+        if result:
+            return result
+
     return None
 
 

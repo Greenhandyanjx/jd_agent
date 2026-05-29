@@ -135,7 +135,7 @@ class AgentOrchestrator:
         
         # 方法：构造消息后，手动走 _run_agent_loop 并注入回调
         session = self.loop.sessions.get_or_create(msg.session_key)
-        history = session.get_history(max_messages=0)
+        history = session.get_history(max_messages=30)
         initial_messages = self.loop.context.build_messages(
             history=history,
             current_message=msg.content,

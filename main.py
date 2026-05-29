@@ -185,10 +185,15 @@ if "history_loaded" not in st.session_state:
     if history:
         for msg in history:
             role = msg.get("role", "")
+            # 跳过工具调用专用的 assistant 消息（content 空 + 有 tool_calls）
+            if role == "assistant" and not msg.get("content") and msg.get("tool_calls"):
+                continue
             if role in ("user", "assistant"):
+                # content 可能为 None/Pydantic null，统一转为空字符串
+                content = msg.get("content") or ""
                 st.session_state.messages.append({
                     "role": role,
-                    "content": msg.get("content", ""),
+                    "content": content,
                 })
     st.session_state.history_loaded = True
 

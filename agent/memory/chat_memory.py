@@ -74,51 +74,9 @@ class ChatMemory:
         self.dream.summarizer_fn = analyze_fn
         self.dream.dedup_fn = dedup_fn
 
-    # ─── 上下文构建 ──────────────────────────────────
-
-    def build_context(
-        self,
-        session_memory_context: str = "",
-        max_memory_chars: int = 8000,
-        max_history_entries: int = 5,
-    ) -> str:
-        """构建完整的记忆上下文（用于注入 system prompt）。
-
-        组装顺序：
-        1. 长期记忆：MEMORY.md
-        2. 中期记忆：history.jsonl 最近几条摘要
-        3. 短期记忆：由外部调用者传入（session.get_history() 已含）
-
-        Args:
-            session_memory_context: 可选的 session 特定上下文（如 ContextBuilder.get()）
-            max_memory_chars: MEMORY.md 截断字符数
-            max_history_entries: 从 history.jsonl 读取的最新条目数
-
-        Returns:
-            格式化的上下文文本（可为空）
-        """
-        parts = []
-        memory = self.store.get_memory_context()
-        if memory:
-            parts.append(memory[:max_memory_chars])
-
-        # 中期记忆
-        entries = self.history_jsonl.read_all()
-        if entries:
-            recent = entries[-max_history_entries:]
-            summary_lines = []
-            for i, e in enumerate(recent, 1):
-                summary = e.get("summary", "")
-                if summary:
-                    # 截断到 200 字
-                    summary_lines.append(f"## 历史阶段 {i}\n{summary[:200]}")
-            if summary_lines:
-                parts.append("## 对话历史摘要\n" + "\n\n".join(summary_lines))
-
-        if session_memory_context:
-            parts.append(session_memory_context)
-
-        return "\n\n---\n\n".join(parts)
+    # ─── 上下文构建（已移至 ContextBuilder）────────────
+    # build_context() 已移除，ContextBuilder 是唯一上下文组装入口。
+    # ChatMemory 只负责记忆的存取和管理。
 
     # ─── Consolidation ──────────────────────────────
 
