@@ -1,0 +1,3 @@
+{"_type": "metadata", "key": "test:sanitize:null", "created_at": "2026-05-31T13:05:39.482198", "updated_at": "2026-05-31T13:05:40.904914", "metadata": {}, "last_consolidated": 0}
+{"role": "user", "content": "测试\u0000测试", "timestamp": 1780203940.9049144}
+{"role": "assistant", "content": "好的！测试收到 ✅\n\n系统运行正常，请问有什么可以帮你的吗？😊", "timestamp": 1780203940.9049144}

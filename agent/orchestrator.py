@@ -45,11 +45,13 @@ class AgentOrchestrator:
         provider: LLMProvider | None = None,
         workspace: str | None = None,
         skills_dir: str | None = None,
+        pg_config: dict | None = None,
     ):
         self.bus = MessageBus()
         self.provider = provider
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         self.skills_dir = Path(skills_dir).expanduser().resolve() if skills_dir else None
+        self.pg_config = pg_config
         self.loop: AgentLoop | None = None
         self._task: asyncio.Task | None = None
 
@@ -67,11 +69,12 @@ class AgentOrchestrator:
             provider=self.provider,
             workspace=self.workspace,
             skills_dir=self.skills_dir,
+            pg_config=self.pg_config,
         )
         self._task = asyncio.create_task(self.loop.run())
 
-        # 初始化技能系统：扫描 skills/ 目录，自动发现并注册 Skill
-        await self.loop.initialize_skills()
+        # 异步初始化：PG 连接池 → 技能自动发现
+        await self.loop.initialize()
 
         logger.info("[Orchestrator] Agent 初始化完成")
 
@@ -134,7 +137,7 @@ class AgentOrchestrator:
         # 但我们不修改 _process_message 签名，改用内部模式
         
         # 方法：构造消息后，手动走 _run_agent_loop 并注入回调
-        session = self.loop.sessions.get_or_create(msg.session_key)
+        session = await self.loop.sessions.aget_or_create(msg.session_key)
         history = session.get_history(max_messages=30)
         initial_messages = self.loop.context.build_messages(
             history=history,
@@ -154,7 +157,7 @@ class AgentOrchestrator:
 
         # 持久化（_process_message 中的部分逻辑）
         self.loop._save_turn(session, all_msgs, 1 + len(history))
-        self.loop.sessions.save(session)
+        await self.loop.sessions.asave(session)
 
         # yield 流式内容
         if stream_buffer:
@@ -221,9 +224,11 @@ class AgentOrchestrator:
     # ─── 生命周期 ──────────────────────────────
 
     async def shutdown(self) -> None:
-        """关闭 Agent"""
+        """关闭 Agent（停止循环 → 关闭 PG 连接池 → 取消任务）"""
         if self.loop:
             self.loop.stop()
+            # 关闭 PG 连接池
+            await self.loop.sessions.close_pg()
         if self._task:
             self._task.cancel()
             try:

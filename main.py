@@ -33,7 +33,7 @@ from loguru import logger
 # ─────────────────────────────────────────────────────────
 
 # API 地址：默认 localhost:8000，可通过环境变量覆盖
-API_BASE_URL = os.environ.get("JD_AGENT_API_URL", "http://127.0.0.1:8000")
+API_BASE_URL = os.environ.get("JD_AGENT_API_URL", "http://127.0.0.1:8001")
 
 st.set_page_config(
     page_title="JD-Agent 智能助手",
@@ -174,14 +174,14 @@ def fetch_history(session_key: Optional[str] = None) -> list[dict]:
 # ─────────────────────────────────────────────────────────
 
 if "current_session_id" not in st.session_state:
-    st.session_state.current_session_id = None  # 由首次 chat 响应自动设置
+    st.session_state.current_session_id = "cli:direct"  # 固定会话 key，读写与 CLI 一致
 
 if "messages" not in st.session_state:
     st.session_state.messages = []              # 前端展示用消息列表
 
-# ── 启动时尝试拉取历史（恢复上次会话） ──
+# ── 启动时尝试拉取历史（从 PG 读取，JSONL 保底） ──
 if "history_loaded" not in st.session_state:
-    history = fetch_history()
+    history = fetch_history(session_key=st.session_state.current_session_id)
     if history:
         for msg in history:
             role = msg.get("role", "")

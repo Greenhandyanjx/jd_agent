@@ -62,6 +62,55 @@ class AgentLoop:
 
     # 工具结果最大长度（防止 LLM 被撑爆）
     _TOOL_RESULT_MAX_CHARS = 16_000
+    # content 最大字符数（防撑爆存储/带宽）
+    _CONTENT_MAX_CHARS = 100_000
+    # 消息字段白名单（防止 LLM 塞入未知字段）
+    _ALLOWED_MESSAGE_FIELDS = frozenset({
+        "role", "content", "tool_calls", "tool_call_id", "name", "timestamp",
+    })
+
+    # ─── 消息消毒 ────────────────────────────
+
+    @staticmethod
+    def _sanitize_message(entry: dict) -> dict:
+        """
+        消毒：确保消息数据符合存储和 LLM API 的要求。
+
+        处理项：
+        1. content 不能为 None（LLM 将 null 渲染为 "None"）
+        2. 超长 content 截断（防撑爆存储）
+        3. 移除空字符 \x00（PG 拒绝写入）
+        4. tool_calls 必须是 list[dict]，否则丢弃
+        5. 移除 schema 未定义的字段
+        """
+        entry = dict(entry)
+
+        # ── content 处理 ──
+        content = entry.get("content")
+        if content is None:
+            entry["content"] = ""
+        elif isinstance(content, str):
+            content = content.replace("\x00", "")
+            if len(content) > AgentLoop._CONTENT_MAX_CHARS:
+                content = content[:AgentLoop._CONTENT_MAX_CHARS] + "\n... (截断)"
+            entry["content"] = content
+        else:
+            entry["content"] = str(content)
+
+        # ── tool_calls 校验 ──
+        tc = entry.get("tool_calls")
+        if tc is not None:
+            if not (isinstance(tc, list) and all(isinstance(x, dict) for x in tc)):
+                logger.warning(f"[Agent] 丢弃非法 tool_calls: type={type(tc).__name__}")
+                entry.pop("tool_calls", None)
+
+        # ── 字段白名单 ──
+        for key in list(entry.keys()):
+            if key not in AgentLoop._ALLOWED_MESSAGE_FIELDS:
+                entry.pop(key, None)
+
+        entry.setdefault("role", "user")
+        return entry
 
     def __init__(
         self,
@@ -72,6 +121,7 @@ class AgentLoop:
         max_iterations: int = 40,
         context_window_tokens: int = 65_536,
         skills_dir: str | Path | None = None,
+        pg_config: dict | None = None,
     ):
         """初始化 Agent Loop。
 
@@ -83,6 +133,7 @@ class AgentLoop:
             max_iterations: 最大 ReAct 循环轮数
             context_window_tokens: 上下文窗口大小（用于记忆压缩）
             skills_dir: 技能目录路径（可选，默认 workspace/skills）
+            pg_config: PostgreSQL 配置（可选，启用后会话持久化到 PG）
         """
         self.bus = bus
         self.provider = provider
@@ -94,7 +145,7 @@ class AgentLoop:
 
         # 核心组件
         self.context = ContextBuilder(workspace)
-        self.sessions = SessionManager(workspace)
+        self.sessions = SessionManager(workspace, pg_config=pg_config)
         self.tools = ToolRegistry()
 
         # 技能系统（对标 OpenClaw 的 skills/ 机制）
@@ -129,6 +180,17 @@ class AgentLoop:
 
         # 注册默认工具
         self._register_default_tools()
+
+    async def initialize(self) -> None:
+        """
+        异步初始化 Agent 子系统。
+
+        按顺序：
+        1. 初始化 PostgreSQL 连接池（如果有配置）
+        2. 发现并加载技能插件
+        """
+        await self.sessions.initialize_pg()
+        await self.initialize_skills()
 
     async def initialize_skills(self) -> None:
         """
@@ -420,8 +482,8 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"[Agent] 处理来自 {msg.channel}:{msg.sender_id} 的消息: {preview}")
 
-        # 获取或创建 session
-        session = self.sessions.get_or_create(msg.session_key)
+        # 获取或创建 session（异步：优先从 PG 加载）
+        session = await self.sessions.aget_or_create(msg.session_key)
 
         # ── 技能匹配：根据用户意图匹配最相关的技能 ──
         skill_context = await self._match_skills(msg.content)
@@ -446,18 +508,19 @@ class AgentLoop:
         if final_content is None:
             final_content = "处理完成，但没有生成回复。"
 
-        # 持久化消息
+        # 持久化消息（异步双写：PG + JSONL）
         self._save_turn(session, all_msgs, 1 + len(history))
-        self.sessions.save(session)
+        await self.sessions.asave(session)
 
         # 触发记忆 consolidation
         await self.memory_consolidator.maybe_consolidate(session)
 
-        # 截断已 consolidated 的消息（数据已持久化到 JSONL + history.jsonl）
+        # 截断已 consolidated 的消息（仅清内存，不写存储）
+        # 数据已在 consolidation 前的 asave() 中持久化到 PG + JSONL + history.jsonl，
+        # 不再调用 asave() 避免用空 messages 覆盖 JSONL 文件。
         if session.last_consolidated > 0:
             session.messages[:session.last_consolidated] = []
             session.last_consolidated = 0
-            self.sessions.save(session)
 
         # 触发 Dream 归档（积攒至少 3 条未处理的 consolidation 时执行）
         try:
@@ -514,13 +577,14 @@ class AgentLoop:
     def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
         """
         将本轮消息保存到 session。
-        
+
         skip: 要跳过的消息数（即历史消息的数量）
         只保存本轮新生成的消息。
         """
         for m in messages[skip:]:
             entry = dict(m)
-            role, content = entry.get("role"), entry.get("content")
+            role = entry.get("role")
+            content = entry.get("content")
 
             # 跳过空的 assistant 消息（可能由 tool-call-only 消息产生）
             if role == "assistant" and not content and not entry.get("tool_calls"):
@@ -530,6 +594,9 @@ class AgentLoop:
             if role == "tool":
                 if isinstance(content, str) and len(content) > self._TOOL_RESULT_MAX_CHARS:
                     entry["content"] = content[:self._TOOL_RESULT_MAX_CHARS] + "\n... (截断)"
+
+            # 消毒：content 非空/截断/空字符、tool_calls 校验、字段白名单
+            entry = self._sanitize_message(entry)
 
             entry.setdefault("timestamp", time.time())
             session.messages.append(entry)
@@ -547,7 +614,15 @@ class AgentLoop:
     ) -> OutboundMessage | None:
         """
         直接处理消息（不走 MessageBus，适用于 CLI 模式）。
+
+        注意：session_key 的格式为 "channel:chat_id"，
+        例如 "cli:direct" → channel=cli, chat_id=direct。
+        如果传入的 session_key 包含冒号，会自动分解覆盖 channel/chat_id。
         """
+        parts = session_key.split(":", 1)
+        if len(parts) == 2:
+            channel, chat_id = parts[0], parts[1]
+
         msg = InboundMessage(
             channel=channel,
             sender_id="user",

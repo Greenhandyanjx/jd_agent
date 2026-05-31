@@ -33,3 +33,6 @@ pytest-asyncio>=0.23.0
 
 # 部署
 docker>=6.0.0
+
+# PostgreSQL（可选，不装则回退 JSONL 文件存储）
+asyncpg>=0.29.0

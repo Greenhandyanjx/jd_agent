@@ -13,6 +13,7 @@
 # 环境变量参考 (.env):
 #   DEEPSEEK_API_KEY=sk-xxx          # 你的 API Key
 #   DEFAULT_MODEL=deepseek-chat       # 模型名
+#   DATABASE_URL=...                  # PostgreSQL 连接串（可选，不配则用 JSONL）
 #   API_PORT=8000                     # API 端口
 #   STREAMLIT_PORT=8501               # Streamlit 端口
 # ─────────────────────────────────────────────────────────
@@ -33,14 +34,17 @@ services:
       - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - DEFAULT_MODEL=${DEFAULT_MODEL:-deepseek-chat}
+      - DATABASE_URL=postgresql://jdagent:${PG_PASSWORD:-devpassword}@postgres:5432/jdagent
       - PYTHONPATH=/app
       - LOG_LEVEL=info
     volumes:
-      # 持久化：数据库（FAISS 向量索引）、会话、日志
       - jd-agent-db:/app/db
       - jd-agent-logs:/app/logs
       - jd-agent-sessions:/app/sessions
       - jd-agent-memory:/app/memory
+    depends_on:
+      postgres:
+        condition: service_healthy
     command: uvicorn api.app:app --host 0.0.0.0 --port 8000 --log-level info
     restart: unless-stopped
     healthcheck:
@@ -56,11 +60,10 @@ services:
       context: .
       dockerfile: Dockerfile
     image: jd-agent:latest
-    container_name: jd-agent-ui
     ports:
       - "${STREAMLIT_PORT:-8501}:8501"
     environment:
-      - JD_AGENT_API_URL=http://api:8000   # Docker 网络内通过服务名访问
+      - JD_AGENT_API_URL=http://api:8000
       - PYTHONPATH=/app
     depends_on:
       api:
@@ -72,8 +75,30 @@ services:
       --server.headless true
     restart: unless-stopped
 
+  # ── PostgreSQL 数据库 ──
+  postgres:
+    image: postgres:16-alpine
+    container_name: jd-agent-postgres
+    environment:
+      POSTGRES_DB: jdagent
+      POSTGRES_USER: jdagent
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-devpassword}
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./db/migrations/001_init.sql:/docker-entrypoint-initdb.d/001_init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jdagent -d jdagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
 volumes:
   jd-agent-db:
   jd-agent-logs:
   jd-agent-sessions:
   jd-agent-memory:
+  pgdata:

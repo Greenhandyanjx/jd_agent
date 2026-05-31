@@ -26,6 +26,7 @@ from pydantic import BaseModel, Field
 from agent.orchestrator import AgentOrchestrator
 from agent.providers.openai_provider import OpenAIProvider
 from agent.tools.tool_definitions import register_all_tools
+from utils.config import load_database_config
 
 
 # ─────────────────────────────────────────────────────────
@@ -55,6 +56,7 @@ class HealthResponse(BaseModel):
     skills_count: int = 0
     skills_names: list[str] = []
     sessions_count: int = 0
+    pg_available: bool = False
 
 
 class HistoryMessage(BaseModel):
@@ -122,15 +124,25 @@ async def get_orchestrator() -> AgentOrchestrator:
         from agent.providers.tongyi_provider import TongyiProvider
         provider = TongyiProvider(model="qwen-plus")
 
-    # ── 2. 创建 Orchestrator（自动初始化技能系统）──
+    # ── 2. 尝试加载 PostgreSQL 配置（没有配置则继续用 JSONL）──
+    pg_config = None
+    try:
+        pg_config = load_database_config()
+        if pg_config:
+            logger.info(f"[API] PostgreSQL 已配置，DSN={pg_config.get('dsn', '')[:30]}...")
+    except Exception as e:
+        logger.info(f"[API] PostgreSQL 未配置，使用 JSONL 存储: {e}")
+
+    # ── 3. 创建 Orchestrator（自动初始化技能系统）──
     orchestrator = AgentOrchestrator(
         provider=provider,
         workspace=workspace,
         skills_dir=skills_dir,  # 技能自动发现目录
+        pg_config=pg_config,    # PostgreSQL 配置（可选）
     )
     await orchestrator.initialize()
 
-    # ── 3. 注册内置业务工具 ──
+    # ── 4. 注册内置业务工具 ──
     registry = orchestrator.get_tool_registry()
     if registry is not None:
         register_all_tools(registry)
@@ -159,12 +171,18 @@ async def health_check():
     """
     orch = await get_orchestrator()
     tools = orch.get_all_tools()
-    # 统计 sessions 目录中的会话文件数
+    # 会话数（优先查 PG，回退到 JSONL 文件扫描）
     sessions_count = 0
+    pg_available = False
     try:
-        sessions_dir = orch.workspace / "sessions"
-        if sessions_dir.exists():
-            sessions_count = len(list(sessions_dir.glob("*.jsonl")))
+        if orch.loop and orch.loop.sessions.pg_available:
+            sessions_list = await orch.loop.sessions.alist_sessions()
+            sessions_count = len(sessions_list)
+            pg_available = True
+        else:
+            sessions_dir = orch.workspace / "sessions"
+            if sessions_dir.exists():
+                sessions_count = len(list(sessions_dir.glob("*.jsonl")))
     except Exception:
         pass
     # 技能系统信息
@@ -181,6 +199,7 @@ async def health_check():
         skills_count=skills_count,
         skills_names=skills_names,
         sessions_count=sessions_count,
+        pg_available=pg_available,
     )
 
 
@@ -210,7 +229,7 @@ async def chat(request: ChatRequest):
         try:
             response_text = await orch.chat_async(
                 request.message,
-                session_key=f"api:{session_id}",
+                session_key=session_id,
             )
             return ChatResponse(
                 response=response_text,
@@ -269,17 +288,22 @@ async def get_history(session_key: Optional[str] = Query(None, description="会�
 
     key = session_key or "cli:direct"
     try:
-        session = orch.loop.sessions.get_or_create(key)
+        session = await orch.loop.sessions.aget_or_create(key)
         history = session.get_history(max_messages=200)
-        # 过滤敏感字段，只保留 role / content / tool_calls
-        # 同时跳过工具调用专用的 assistant 消息（content 空 + 有 tool_calls）
+        # 返回完整消息列表（包含 tool_calls），由前端自行过滤展示
+        # 相比之前跳过 tool_calls 消息的策略，前端需要完整上下文
         cleaned = []
         for msg in history:
-            if msg.get("role") == "assistant" and not msg.get("content") and msg.get("tool_calls"):
-                continue
-            entry = {"role": msg.get("role", "")}
+            entry: dict = {"role": msg.get("role", "")}
             if msg.get("content"):
                 entry["content"] = msg["content"]
+            if msg.get("tool_calls"):
+                # 兼容 PG JSONB 反序列化的类型差异
+                tc = msg["tool_calls"]
+                if isinstance(tc, str):
+                    tc = json.loads(tc)
+                if isinstance(tc, list):
+                    entry["tool_calls"] = tc
             cleaned.append(entry)
         return HistoryResponse(history=cleaned, total=len(cleaned))
     except Exception as e:
