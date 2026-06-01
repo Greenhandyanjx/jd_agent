@@ -122,6 +122,7 @@ class AgentLoop:
         context_window_tokens: int = 65_536,
         skills_dir: str | Path | None = None,
         pg_config: dict | None = None,
+        redis_cache=None,
     ):
         """初始化 Agent Loop。
 
@@ -134,6 +135,7 @@ class AgentLoop:
             context_window_tokens: 上下文窗口大小（用于记忆压缩）
             skills_dir: 技能目录路径（可选，默认 workspace/skills）
             pg_config: PostgreSQL 配置（可选，启用后会话持久化到 PG）
+            redis_cache: RedisCache 实例（可选，启用四层缓存）
         """
         self.bus = bus
         self.provider = provider
@@ -145,8 +147,16 @@ class AgentLoop:
 
         # 核心组件
         self.context = ContextBuilder(workspace)
-        self.sessions = SessionManager(workspace, pg_config=pg_config)
+        self.sessions = SessionManager(workspace, pg_config=pg_config, redis_cache=redis_cache)
         self.tools = ToolRegistry()
+
+        # Redis 缓存系统（可选，由 orchestrator 注入）
+        self.redis_cache = redis_cache
+        self.rate_limiter = None
+        if redis_cache:
+            from agent.cache.redis_cache import RedisRateLimiter
+            self.rate_limiter = RedisRateLimiter(redis_cache)
+            logger.info("[Agent] Redis 缓存 + 限流器已就绪")
 
         # 技能系统（对标 OpenClaw 的 skills/ 机制）
         # 扫描 skills/ 目录，自动发现 Skill → 注册底层 Tool
@@ -232,6 +242,7 @@ class AgentLoop:
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
+        session_key: str = "",
         on_progress: Callable[..., Any] | None = None,
         on_stream: Callable[[str], Any] | None = None,
         on_stream_end: Callable[..., Any] | None = None,
@@ -263,12 +274,103 @@ class AgentLoop:
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        _cache_miss = False          # track iteration-1 cache miss for stampede protection
+        _stampede_lock_name = None   # distributed lock name for stampede protection
 
         while iteration < self.max_iterations:
             iteration += 1
 
             # 获取工具定义（每次循环都重新获取，因为工具可能动态变更）
             tool_defs = self.tools.get_definitions()
+
+            # ═══ ① LLM Response Cache（仅第一轮有效）═══
+            # 命中缓存 = 跳过整个 ReAct 循环，直接返回历史结果。
+            # 只检查第一轮的原因：后续轮次含工具结果，缓存命中率极低。
+            if iteration == 1 and self.redis_cache:
+                cached = await self.redis_cache.get_llm_cache(session_key, messages)
+                if cached is None:
+                    _cache_miss = True
+                else:
+                    _cache_miss = False
+                if cached is not None:
+                    logger.info("[Agent] LLM 缓存命中，跳过 ReAct 循环")
+                    final_content = cached.get("content")
+                    tc_list = cached.get("tool_calls", [])
+                    for tc in tc_list:
+                        tools_used.append(tc.get("name", "unknown"))
+                    # 将缓存的 assistant 消息追加到消息列表
+                    messages = self._add_assistant_message(messages, final_content, tc_list if tc_list else None)
+                    # 如果缓存里有工具调用，重新执行工具并继续循环
+                    if tc_list:
+                        # 注意：缓存命中时工具结果是 NOT 缓存的（工具可能有副作用），
+                        # 所以即使缓存命中，仍需重新执行工具。
+                        # 只有纯文本回复可以完全跳过 LLM 调用。
+                        results = await asyncio.gather(*(
+                            self.tools.execute(tc["name"], tc.get("arguments", {}))
+                            for tc in tc_list
+                        ), return_exceptions=True)
+                        for tc, result in zip(tc_list, results):
+                            if isinstance(result, BaseException):
+                                result = f"错误: {type(result).__name__}: {result}"
+                            messages = self._add_tool_result(messages, tc["id"], tc["name"], result)
+                        continue  # 继续循环（让 LLM 基于工具结果生成最终回复）
+                    else:
+                        # 纯文本回复，直接返回
+                        tool_defs = self.tools.get_definitions()
+                        break
+
+            # ═══ ② Rate Limiter：LLM 调用级别限流 ═══
+            # 与入口的消息级别限流不同，这里限制的是 LLM API 调用频率。
+            # 防止工具循环中过快调用 LLM（某些场景可能几秒内多次调 API）。
+            # 使用全局 key（不区分 session），控制整体 API 费用。
+            if self.rate_limiter:
+                llm_allowed, _ = await self.rate_limiter.check_atomic(
+                    key="global:llm",
+                    limit=self.rate_limiter.cache.rate_limit_llm,
+                    window=self.rate_limiter.cache.rate_limit_llm_window,
+                )
+                if not llm_allowed:
+                    logger.warning("[RateLimiter] LLM 调用超限，等待")
+                    await asyncio.sleep(1)
+                    continue
+
+            # ═══ ②.5 缓存击穿防护（分布式锁）═══
+            # N 个请求同时缓存 miss 时，只有拿到锁的请求调 LLM API，
+            # 其他进程等待 → 双检缓存（缓存击穿防护）。
+            _stampede_lock_name = None
+            if iteration == 1 and self.redis_cache and _cache_miss:
+                _lock_cache_key = self.redis_cache._build_llm_cache_key(session_key, messages)
+                _stampede_lock_name = f"stampede:{_lock_cache_key}"
+                if await self.redis_cache.lock(_stampede_lock_name, ttl=10):
+                    # 双检：等锁期间其他进程可能已填充缓存
+                    cached = await self.redis_cache.get_llm_cache(session_key, messages)
+                    if cached is not None:
+                        await self.redis_cache.unlock(_stampede_lock_name)
+                        _stampede_lock_name = None
+                        logger.info("[Agent] 双检缓存命中（其他进程已填充），跳过 LLM 调用")
+                        final_content = cached.get("content")
+                        tc_list = cached.get("tool_calls", [])
+                        for tc in tc_list:
+                            tools_used.append(tc.get("name", "unknown"))
+                        messages = self._add_assistant_message(
+                            messages, final_content, tc_list if tc_list else None
+                        )
+                        if tc_list:
+                            results = await asyncio.gather(*(
+                                self.tools.execute(tc["name"], tc.get("arguments", {}))
+                                for tc in tc_list
+                            ), return_exceptions=True)
+                            for tc, result in zip(tc_list, results):
+                                if isinstance(result, BaseException):
+                                    result = f"错误: {type(result).__name__}: {result}"
+                                messages = self._add_tool_result(messages, tc["id"], tc["name"], result)
+                            continue
+                        else:
+                            break
+                else:
+                    logger.info("[Agent] 等待其他进程完成 LLM 调用（缓存击穿防护）")
+                    await asyncio.sleep(0.5)
+                    continue
 
             # === LLM 调用 ===
             if on_stream:
@@ -289,6 +391,20 @@ class AgentLoop:
 
             # 记录 token 用量
             usage = response.usage or {}
+
+            # ═══ ③ LLM Response Cache 写入（第一轮）═══
+            if iteration == 1 and self.redis_cache and not on_stream:
+                # 缓存 LLM 响应，避免相同上下文重复调 API。
+                # 缓存内容：content + tool_calls（不缓存工具结果——工具可能有副作用）
+                cache_data = {
+                    "content": response.content,
+                    "tool_calls": [
+                        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+                        for tc in (response.tool_calls or [])
+                    ],
+                    "finish_reason": response.finish_reason,
+                }
+                await self.redis_cache.set_llm_cache(session_key, messages, cache_data)
 
             if response.has_tool_calls:
                 # ─── Act: 执行工具调用 ───
@@ -333,6 +449,11 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
 
+                # 释放分布式锁（工具执行路径走到这里，解锁后继续下一轮迭代）
+                if _stampede_lock_name:
+                    await self.redis_cache.unlock(_stampede_lock_name)
+                    _stampede_lock_name = None
+
             else:
                 # ─── LLM 给出最终回复 ───
                 if on_stream and on_stream_end:
@@ -341,6 +462,9 @@ class AgentLoop:
                 # 检查是否出错
                 if response.finish_reason == "error":
                     logger.error(f"[Agent] LLM 返回错误: {(response.content or '')[:200]}")
+                    if _stampede_lock_name:
+                        await self.redis_cache.unlock(_stampede_lock_name)
+                        _stampede_lock_name = None
                     final_content = response.content or "抱歉，调用 AI 模型时出错。"
                     break
 
@@ -350,6 +474,9 @@ class AgentLoop:
                     reasoning_content=response.reasoning_content,
                     thinking_blocks=response.thinking_blocks,
                 )
+                if _stampede_lock_name:
+                    await self.redis_cache.unlock(_stampede_lock_name)
+                    _stampede_lock_name = None
                 final_content = response.content
                 break
 
@@ -482,6 +609,23 @@ class AgentLoop:
         preview = msg.content[:80] + "..." if len(msg.content) > 80 else msg.content
         logger.info(f"[Agent] 处理来自 {msg.channel}:{msg.sender_id} 的消息: {preview}")
 
+        # ── Step 0: Rate Limiter（限流检查）──
+        # 在真正处理消息之前先检查是否超限。
+        # 这样做的好处：限流时连 session 都不需要加载，最大程度节约资源。
+        if self.rate_limiter:
+            allowed, remaining = await self.rate_limiter.check(msg.session_key)
+            if not allowed:
+                logger.warning(
+                    f"[RateLimiter] 会话 {msg.session_key} 请求超限，拒绝"
+                )
+                return OutboundMessage(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    content="请求过于频繁，请稍后再试。"
+                    f"（每 {self.rate_limiter.cache.rate_limit_window} 秒最多 "
+                    f"{self.rate_limiter.cache.rate_limit_default} 次）",
+                )
+
         # 获取或创建 session（异步：优先从 PG 加载）
         session = await self.sessions.aget_or_create(msg.session_key)
 
@@ -503,14 +647,19 @@ class AgentLoop:
         # 运行 ReAct 循环
         final_content, tools_used, all_msgs = await self._run_agent_loop(
             initial_messages,
+            session_key=msg.session_key,
         )
 
         if final_content is None:
             final_content = "处理完成，但没有生成回复。"
 
-        # 持久化消息（异步双写：PG + JSONL）
+        # 持久化消息（异步三写：PG + Redis + JSONL）
         self._save_turn(session, all_msgs, 1 + len(history))
         await self.sessions.asave(session)
+
+        # 使 LLM 缓存失效：新消息意味着对话上下文已变，旧缓存不再适用
+        if self.redis_cache:
+            await self.redis_cache.invalidate_llm_cache(msg.session_key)
 
         # 触发记忆 consolidation
         await self.memory_consolidator.maybe_consolidate(session)

@@ -47,6 +47,8 @@ from utils.logger import logger
 from utils.prompt_loader import load_rag_prompts
 from model.factory import chat_model
 
+from agent.cache.redis_cache import get_redis_cache
+
 from rag.schema_validator import validate_params, RetrieverParams
 from rag.retry import retry_with_fallback
 from rag.retrieval.hybrid_retriever import HybridRetriever
@@ -97,6 +99,14 @@ class RagRetrievalService:
         # 启动时初始化 BM25 索引（确保双路召回生效）
         self._init_bm25_index()
 
+        # RAG 缓存（Redis，可选）
+        # 当 Redis 不可用时，降级为不缓存，不影响检索功能
+        self._redis_cache = None
+        try:
+            self._redis_cache = get_redis_cache()
+        except Exception as e:
+            logger.debug(f"[RAG] Redis 缓存不可用（将降级为不缓存）: {e}")
+
     # ─── 核心检索 ────────────────────────────
 
     def retrieve(self, query: str, k: int = 5) -> str:
@@ -132,7 +142,22 @@ class RagRetrievalService:
                 logger.warning(f"[RAG] Query Rewrite 失败: {e}，使用原始查询")
                 final_query = query
         
-        # ── Step 2: 多路召回 ──
+        # ── Step 2: RAG Cache 查询 ──
+        # 使用改写后的 query 做缓存 key。因为 query_rewriter 保证输出稳定，
+        # 不同用户问同一个问题 → 改写后结果相同 → 缓存命中。
+        cached = None
+        if self._redis_cache and final_query:
+            try:
+                cached = self._redis_cache.get_rag_cache(final_query, k)
+                if cached:
+                    logger.info(f"[RAG] 缓存命中: query='{final_query[:30]}...'")
+            except Exception as e:
+                logger.debug(f"[RAG] 缓存查询失败（降级到实时检索）: {e}")
+
+        if cached:
+            return cached
+
+        # ── Step 3: 多路召回 ──
         context_docs: list[Document] = []
         if self.hybrid_retriever:
             try:
@@ -150,7 +175,7 @@ class RagRetrievalService:
         
         logger.info(f"[RAG] 检索到 {len(context_docs)} 篇文档")
         
-        # ── Step 3: Reranker ──
+        # ── Step 4: Reranker ──
         if self.reranker and len(context_docs) > 1:
             try:
                 context_docs = self.reranker.rerank(query, context_docs)
@@ -158,8 +183,21 @@ class RagRetrievalService:
             except Exception as e:
                 logger.warning(f"[RAG] Reranker 失败: {e}，使用原始排序")
         
-        # ── Step 4: 格式化为纯文本（给 Agent 用）──
-        return self._format_docs_for_agent(context_docs)
+        # ── Step 5: 格式化为纯文本（给 Agent 用）──
+        result = self._format_docs_for_agent(context_docs)
+
+        # ── Step 6: 写入 RAG 缓存 ──
+        # 缓存格式化后的检索结果，下次相同 query 直接返回，跳过整个检索链路。
+        # 为什么用改写后的 final_query 做 key？
+        # "深度学习有哪些应用" 和 "深度学习应用" 经过 Query Rewriter 后可能变成
+        # 相同的改写结果 → 缓存命中 → 检索加速。
+        if self._redis_cache and final_query:
+            try:
+                self._redis_cache.set_rag_cache(final_query, k, result)
+            except Exception as e:
+                logger.debug(f"[RAG] 缓存写入失败: {e}")
+
+        return result
     
     def retrieve_with_reranker(self, query: str, k: int = 5) -> tuple[list[Document], str]:
         """
@@ -227,9 +265,18 @@ class RagRetrievalService:
     # ─── 知识库管理 ──────────────────────────
     
     def update_knowledge_base(self):
-        """重新加载知识库"""
+        """重新加载知识库（同时清除 RAG 缓存，避免返回旧数据）"""
         self.vector_store.load_document()
         logger.info("[RAG] 知识库已更新")
+
+        # 知识库更新后清除所有 RAG 缓存，保证下次检索不返回旧数据
+        if self._redis_cache:
+            try:
+                cleared = self._redis_cache.clear_prefix_sync("rag:")
+                if cleared > 0:
+                    logger.info(f"[RAG] 已清除 {cleared} 条缓存")
+            except Exception as e:
+                logger.debug(f"[RAG] 缓存清除失败: {e}")
         
         if self.hybrid_retriever:
             try:

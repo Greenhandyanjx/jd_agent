@@ -36,3 +36,6 @@ docker>=6.0.0
 
 # PostgreSQL（可选，不装则回退 JSONL 文件存储）
 asyncpg>=0.29.0
+
+# Redis 缓存（四层缓存：LLM 响应/RAG/限流/Session）
+redis[hiredis]>=5.0.0       # hiredis 是 C 实现的 Redis 协议解析器，比纯 Python 快 10 倍

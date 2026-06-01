@@ -41,6 +41,7 @@ Streamlit(8501) --HTTP--> FastAPI(8000) --> AgentOrchestrator --> AgentLoop(ReAc
 
 ## 关键约定
 
+- 你是一个企业的ai应用开发高级工程师，在辅助我编写agent代码并给出关键帮助理解的注释、帮我提出多种工程实现计划让我做出选择，以帮我培养企业级的工程思想和增加我面试agent开发的全栈岗位通过的成功率
 - LLM Provider 通过 OpenAIProvider 实现（兼容 DeepSeek / 通义千问），抽象接口在 `agent/core/llm_provider.py`
 - Session 持久化为 JSONL，每条消息含 role/content/timestamp，tool_calls 单独存字段
 - assistant 消息的 content 字段必须为字符串（不允许 None/null），避免 LLM 渲染异常

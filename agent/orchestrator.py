@@ -23,6 +23,7 @@ from loguru import logger
 from agent.core.types import InboundMessage, OutboundMessage
 from agent.core.llm_provider import LLMProvider
 from agent.bus.queue import MessageBus
+from agent.cache.redis_cache import get_redis_cache
 from agent.loop import AgentLoop
 from agent.tools.registry import ToolRegistry
 
@@ -52,6 +53,7 @@ class AgentOrchestrator:
         self.workspace = Path(workspace or Path.cwd()).expanduser().resolve()
         self.skills_dir = Path(skills_dir).expanduser().resolve() if skills_dir else None
         self.pg_config = pg_config
+        self.redis_cache = None
         self.loop: AgentLoop | None = None
         self._task: asyncio.Task | None = None
 
@@ -60,16 +62,25 @@ class AgentOrchestrator:
     async def initialize(self) -> None:
         """
         初始化 Agent 系统。
-        
+
         必须先调用此方法才能使用 Agent。
         初始化后，技能系统也会自动发现并注册。
+
+        Redis 缓存是可选组件：如果 Redis 不可用（未配置或连接失败），
+        所有缓存操作静默降级（get→None, set→noop），不会影响业务逻辑。
         """
+        # 初始化 Redis 缓存
+        # get_redis_cache() 会从 config/cache.yml 或环境变量 REDIS_URL 读取配置。
+        # 如果 Redis 未配置，返回一个空实例（所有操作静默失败）。
+        self.redis_cache = get_redis_cache()
+
         self.loop = AgentLoop(
             bus=self.bus,
             provider=self.provider,
             workspace=self.workspace,
             skills_dir=self.skills_dir,
             pg_config=self.pg_config,
+            redis_cache=self.redis_cache,
         )
         self._task = asyncio.create_task(self.loop.run())
 
@@ -149,6 +160,7 @@ class AgentOrchestrator:
 
         final_content, tools_used, all_msgs = await self.loop._run_agent_loop(
             initial_messages,
+            session_key=msg.session_key,
             on_stream=on_stream,
         )
 
@@ -224,11 +236,14 @@ class AgentOrchestrator:
     # ─── 生命周期 ──────────────────────────────
 
     async def shutdown(self) -> None:
-        """关闭 Agent（停止循环 → 关闭 PG 连接池 → 取消任务）"""
+        """关闭 Agent（停止循环 → 关闭 PG 连接池 → 关闭 Redis → 取消任务）"""
         if self.loop:
             self.loop.stop()
             # 关闭 PG 连接池
             await self.loop.sessions.close_pg()
+        # 关闭 Redis 连接
+        if self.redis_cache:
+            await self.redis_cache.close()
         if self._task:
             self._task.cancel()
             try:

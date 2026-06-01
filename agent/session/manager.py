@@ -5,23 +5,26 @@
 ┌──────────────────────────────────────────────────┐
 │ SessionManager（路由层）                           │
 │   get_or_create(key)  → ①内存缓存 ②JSONL          │
-│   aget_or_create(key) → ①内存缓存 ②PG ③JSONL     │
+│   aget_or_create(key) → ①内存 ②Redis ③PG ④JSONL  │
 │   save(session)       → JSONL                     │
-│   asave(session)      → PG + JSONL（双写）         │
+│   asave(session)      → PG + Redis + JSONL（三写） │
 └──────────────────┬───────────────────────────────┘
                    │
-        ┌──────────┴──────────┐
-        ▼                     ▼
-   ┌─────────┐         ┌──────────┐
-   │ JSONL   │         │   PG     │
-   │ (保底)   │         │ (主存储)  │
-   └─────────┘         └──────────┘
+        ┌──────────┼──────────┐
+        ▼          ▼          ▼
+   ┌─────────┐ ┌─────────┐ ┌──────────┐
+   │ Redis   │ │   PG    │ │  JSONL   │
+   │ (L2缓存) │ │ (主存储) │ │ (保底)   │
+   └─────────┘ └─────────┘ └──────────┘
+
+四层查找链：内存(L1) → Redis(L2) → PG(L3) → JSONL(L4)
 
 设计原则：
 1. JSONL 始终可用——PG 离线时系统不中断
 2. PG 写失败 → 日志告警 + 写入 JSONL（不抛出异常）
 3. 内存缓存作为 L1，减少 PG 读压力
-4. Session 的 in-memory 表示（dataclass）不变，PG/JSONL 只是不同序列化后端
+4. Redis 作为 L2，加速跨进程会话恢复（进程重启后内存空，但 Redis 热）
+5. Session 的 in-memory 表示（dataclass）不变，各后端只是不同序列化方式
 
 重要约定：
 - assistant 消息的 content 字段必须为字符串（不允许 None/null），
@@ -34,7 +37,10 @@ from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from agent.cache.redis_cache import RedisCache
 
 from loguru import logger
 
@@ -401,7 +407,7 @@ class SessionManager:
     - pg_config=None → 仅 JSONL（向后兼容）
     """
 
-    def __init__(self, workspace: Path, pg_config: dict | None = None):
+    def __init__(self, workspace: Path, pg_config: dict | None = None, redis_cache: "RedisCache | None" = None):
         """
         初始化 SessionManager。
 
@@ -409,21 +415,26 @@ class SessionManager:
             workspace: 工作区路径（sessions 目录建在此路径下）
             pg_config: PostgreSQL 配置字典（可选，不传则仅用 JSONL）
                        {"dsn": "...", "pool_min_size": 1, "pool_max_size": 10, ...}
+            redis_cache: RedisCache 实例（可选，用于 L2 会话缓存）
         """
         self.workspace = workspace
         self.sessions_dir = ensure_dir(workspace / "sessions")
 
-        # 内存缓存：key → Session 对象
-        # 作用：避免频繁读盘/PG，加速重复访问
+        # 内存缓存：key → Session 对象（L1）
+        # 作用：避免频繁读盘/PG/Redis，加速重复访问
         self._cache: dict[str, Session] = {}
 
-        # JSONL 后端（始终启用，作为保底存储）
+        # Redis 缓存（L2）：可选，由外部注入
+        # 作用：跨进程会话恢复。进程重启后内存清空，
+        # 但 Redis 中的缓存还在，避免每次重启都查 PG
+        self._redis = redis_cache
+
+        # JSONL 后端（L4 保底，始终启用）
         self._jsonl = _JsonlBackend(self.sessions_dir)
 
-        # PG 后端（可选，由 pg_config 控制是否启用）
+        # PG 后端（L3 主存储，可选）
         self._pg = None
         if pg_config and pg_config.get("dsn"):
-            # 延迟导入：只有启用 PG 时才加载 asyncpg
             from agent.session.pg_store import PgBackend
             self._pg = PgBackend(pg_config)
             logger.info("[SessionManager] PostgreSQL 后端已配置")
@@ -510,21 +521,46 @@ class SessionManager:
         异步获取/创建会话。
 
         查找链（优先级从高到低）：
-        ① 内存缓存（最快）——避免重复 PG 查询
-        ② PostgreSQL（主存储）——查询后写入缓存
-        ③ JSONL 文件（保底）——PG 不可用时的 fallback
-        ④ 都没有 → 新建空会话
+        ① 内存缓存（L1，最快）——本进程内已加载的 session
+        ② Redis 缓存（L2，快）——跨进程共享，进程重启后可恢复
+        ③ PostgreSQL（L3，主存储）——异步查询
+        ④ JSONL 文件（L4，保底）——PG 不可用时的 fallback
+        ⑤ 都没有 → 新建空会话
 
-        为什么三个后备：
-        - 内存缓存：本进程内加速（最常用路径，命中率 > 90%）
-        - PG：进程重启后缓存清空，从 PG 恢复
-        - JSONL：PG 迁移/故障期间的数据恢复路径
+        为什么四层备份：
+        - L1 内存：本进程加速（最常用路径，命中率 > 90%）
+        - L2 Redis：进程重启后缓存清空，从 Redis 恢复（比 PG 快 10 倍）
+        - L3 PG：跨进程持久化，支持 SQL 查询
+        - L4 JSONL：PG 迁移/故障期间的数据恢复路径
         """
         # L1: 内存缓存
         if key in self._cache:
             return self._cache[key]
 
-        # L2: PostgreSQL
+        # L2: Redis 缓存（独立于 PG，只要配置了就启用）
+        if self._redis:
+            try:
+                data = await self._redis.get_session_cache(key)
+                if data:
+                    session = Session(
+                        key=data["key"],
+                        messages=data.get("messages", []),
+                        created_at=datetime.fromisoformat(data["created_at"])
+                        if isinstance(data.get("created_at"), str)
+                        else datetime.now(),
+                        updated_at=datetime.fromisoformat(data["updated_at"])
+                        if isinstance(data.get("updated_at"), str)
+                        else datetime.now(),
+                        metadata=data.get("metadata", {}),
+                        last_consolidated=data.get("last_consolidated", 0),
+                    )
+                    self._cache[key] = session
+                    logger.debug(f"[SessionManager] 从 Redis 加载会话 {key}")
+                    return session
+            except Exception as e:
+                logger.debug(f"[SessionManager] Redis 加载失败，查 PG: {e}")
+
+        # L3: PostgreSQL
         if self._pg:
             try:
                 data = await self._pg.load(key)
@@ -538,22 +574,28 @@ class SessionManager:
                         last_consolidated=data["last_consolidated"],
                     )
                     self._cache[key] = session
+                    # 同步写入 Redis 缓存（下次查 L2 就能命中）
+                    if self._redis:
+                        await self._redis.set_session_cache(
+                            key, self._session_to_cache_dict(session)
+                        )
                     logger.debug(f"[SessionManager] 从 PG 加载会话 {key}")
                     return session
             except Exception as e:
                 logger.warning(f"[SessionManager] PG 加载失败，尝试 JSONL: {e}")
 
-        # L3: JSONL（保底）
+        # L4: JSONL（保底）
         return self.get_or_create(key)
 
     async def asave(self, session: Session) -> None:
         """
-        异步保存（PG + JSONL 双写）。
+        异步保存（PG + Redis + JSONL 三写）。
 
         写入策略：
-        - PG 主写：异步写入 PostgreSQL
-        - JSONL 保底：同步写入文件系统
-        - 写 PG 失败：记警告日志 + 继续完成 JSONL 写入（不抛异常）
+        - PG 主写：异步写入 PostgreSQL（强一致）
+        - Redis 缓存：异步写入（提升后续读取速度）
+        - JSONL 保底：同步写入文件系统（崩溃恢复用）
+        - 任何后端写失败：记警告日志 + 继续（不抛异常，不影响业务）
         """
         pg_ok = False
         if self._pg:
@@ -572,6 +614,16 @@ class SessionManager:
                     f"已降级到 JSONL: {e}"
                 )
 
+        # 更新 Redis 缓存（L2）
+        # 写入最新数据后，下次 aget_or_create 可以直接从 Redis 加载
+        if self._redis:
+            try:
+                await self._redis.set_session_cache(
+                    session.key, self._session_to_cache_dict(session)
+                )
+            except Exception as e:
+                logger.debug(f"[SessionManager] Redis 缓存更新失败: {e}")
+
         # 无论 PG 成功与否，都写 JSONL（双写策略）
         # 异常隔离：JSONL 写失败只记日志，不抛给调用方
         try:
@@ -582,11 +634,11 @@ class SessionManager:
             )
 
         if pg_ok:
-            logger.debug(f"[SessionManager] 双写完成: {session.key}")
+            logger.debug(f"[SessionManager] 保存完成: {session.key} (PG+Redis+JSONL)")
 
     async def adelete_session(self, key: str, delete_jsonl: bool = False) -> bool:
         """
-        异步删除会话（PG + 可选 JSONL）。
+        异步删除会话（PG + Redis + 可选 JSONL）。
 
         参数:
             key: 会话标识
@@ -597,6 +649,13 @@ class SessionManager:
         只在明确需要清理所有数据时（如测试）才设为 True。
         """
         self._cache.pop(key, None)
+
+        # 删除 Redis 缓存
+        if self._redis:
+            try:
+                await self._redis.delete_session_cache(key)
+            except Exception as e:
+                logger.debug(f"[SessionManager] Redis 缓存删除失败: {e}")
 
         pg_ok = True
         if self._pg:
@@ -624,3 +683,26 @@ class SessionManager:
             except Exception as e:
                 logger.warning(f"[SessionManager] PG 列出会话失败，回退 JSONL: {e}")
         return self._jsonl.list_sessions()
+
+    # ─── 缓存专用工具 ───────────────────────────────
+
+    @staticmethod
+    def _session_to_cache_dict(session: Session) -> dict:
+        """
+        将 Session 对象转为可缓存字典（供 Redis L2 缓存使用）。
+
+        为什么单独做一个方法而不是直接序列化 Session？
+        - 避免序列化全部消息（可能几百条，浪费带宽）
+        - 只保留最近 50 条（Redis 内存有限，且 LLM 通常只看最近 N 条）
+        - 确保存储格式是纯 JSON 可序列化的（Session 中的 datetime 需要转字符串）
+        """
+        MAX_CACHED_MESSAGES = 50
+        messages = session.messages[-MAX_CACHED_MESSAGES:] if len(session.messages) > MAX_CACHED_MESSAGES else session.messages
+        return {
+            "key": session.key,
+            "messages": messages,
+            "created_at": session.created_at.isoformat(),
+            "updated_at": session.updated_at.isoformat(),
+            "metadata": session.metadata,
+            "last_consolidated": session.last_consolidated,
+        }
