@@ -39,3 +39,6 @@ asyncpg>=0.29.0
 
 # Redis 缓存（四层缓存：LLM 响应/RAG/限流/Session）
 redis[hiredis]>=5.0.0       # hiredis 是 C 实现的 Redis 协议解析器，比纯 Python 快 10 倍
+
+# RabbitMQ 异步任务队列（非关键路径任务：Dream/Consolidation/Cleanup）
+aio-pika>=9.0.0             # 异步 RabbitMQ 客户端（基于 asyncio + AMQP）

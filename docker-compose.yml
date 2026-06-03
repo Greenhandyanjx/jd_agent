@@ -116,6 +116,28 @@ services:
       start_period: 10s
     restart: unless-stopped
 
+  # ── RabbitMQ 消息队列（异步后台任务） ──
+  rabbitmq:
+    image: rabbitmq:3-management-alpine     # 带 Management UI 的管理版
+    container_name: jd-agent-rabbitmq
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"       # AMQP 协议端口
+      - "${RABBITMQ_MGMT_PORT:-15672}:15672" # Management UI（http://localhost:15672）
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq     # 持久化消息
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_port_connectivity"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: unless-stopped
+    # Management UI 默认凭据: guest/guest
+    # 访问地址: http://localhost:15672
+
 volumes:
   jd-agent-db:
   jd-agent-logs:
@@ -123,3 +145,4 @@ volumes:
   jd-agent-memory:
   pgdata:
   redis-data:
+  rabbitmq-data:

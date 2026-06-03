@@ -25,6 +25,11 @@ from agent.core.llm_provider import LLMProvider
 from agent.bus.queue import MessageBus
 from agent.cache.redis_cache import get_redis_cache
 from agent.loop import AgentLoop
+from agent.mq import get_mq_config
+from agent.mq.producer import MQProducer
+from agent.mq.consumer import MQConsumer
+from agent.mq.llm_provider import MQLLMProvider
+from agent.mq.llm_worker import LLMRequestWorker
 from agent.tools.registry import ToolRegistry
 
 
@@ -57,6 +62,14 @@ class AgentOrchestrator:
         self.loop: AgentLoop | None = None
         self._task: asyncio.Task | None = None
 
+        # MQ（RabbitMQ 可选——连接失败不阻塞启动）
+        self.mq_config: dict | None = None
+        self.mq_producer: MQProducer | None = None
+        self.mq_consumer: MQConsumer | None = None
+        self._mq_task: asyncio.Task | None = None
+        self._llm_worker: LLMRequestWorker | None = None
+        self._llm_worker_task: asyncio.Task | None = None
+
     # ─── 初始化 ────────────────────────────────
 
     async def initialize(self) -> None:
@@ -74,9 +87,18 @@ class AgentOrchestrator:
         # 如果 Redis 未配置，返回一个空实例（所有操作静默失败）。
         self.redis_cache = get_redis_cache()
 
+        # ── MQ 配置加载（放在 AgentLoop 创建之前，因为要注入 provider）──
+        self.mq_config = get_mq_config()
+
+        # 构造 AgentLoop（如果 MQ 配置了，provider 被 MQLLMProvider 透明包装）
+        loop_provider = self.provider
+        if self.mq_config and self.provider:
+            loop_provider = MQLLMProvider(self.provider, self.mq_config)
+            logger.info("[Orchestrator] LLM 调用将通过 MQ 限流")
+
         self.loop = AgentLoop(
             bus=self.bus,
-            provider=self.provider,
+            provider=loop_provider,
             workspace=self.workspace,
             skills_dir=self.skills_dir,
             pg_config=self.pg_config,
@@ -86,6 +108,30 @@ class AgentOrchestrator:
 
         # 异步初始化：PG 连接池 → 技能自动发现
         await self.loop.initialize()
+
+        # ── MQ 后台任务 Worker 初始化 ──
+        if self.mq_config:
+            # ① 生产者（供 _process_message 发布 Dream/Consolidation 任务）
+            self.mq_producer = MQProducer(self.mq_config)
+            self.loop.mq_producer = self.mq_producer
+
+            # ② MQConsumer：消费 Dream + Consolidation 队列
+            self.mq_consumer = MQConsumer(self.mq_config, agent_loop=self.loop)
+            self._mq_task = asyncio.create_task(self.mq_consumer.start())
+
+            # ③ LLM RPC Worker：消费 llm_request 队列
+            # 注意：使用原始 provider（self.provider），不是 MQLLMProvider
+            # 否则 Worker 调 LLM 会再走 MQ→自己→死循环
+            default_model = self.provider.get_default_model() if self.provider else "deepseek-chat"
+            self._llm_worker = LLMRequestWorker(
+                self.mq_config,
+                provider=self.provider,
+                model=default_model,
+            )
+            self._llm_worker_task = asyncio.create_task(self._llm_worker.start())
+            logger.info("[Orchestrator] RabbitMQ + LLM Worker 已在后台启动")
+        else:
+            logger.info("[Orchestrator] RabbitMQ 未配置，任务将同步执行")
 
         logger.info("[Orchestrator] Agent 初始化完成")
 
@@ -236,7 +282,30 @@ class AgentOrchestrator:
     # ─── 生命周期 ──────────────────────────────
 
     async def shutdown(self) -> None:
-        """关闭 Agent（停止循环 → 关闭 PG 连接池 → 关闭 Redis → 取消任务）"""
+        """关闭 Agent（停止循环 → 关闭 PG/Redis/MQ → 取消任务）"""
+        # 停止 LLM RPC Worker
+        if self._llm_worker:
+            self._llm_worker.stop()
+        if self._llm_worker_task:
+            self._llm_worker_task.cancel()
+            try:
+                await self._llm_worker_task
+            except asyncio.CancelledError:
+                pass
+
+        # 停止 MQ 消费者
+        if self.mq_consumer:
+            self.mq_consumer.stop()
+        if self._mq_task:
+            self._mq_task.cancel()
+            try:
+                await self._mq_task
+            except asyncio.CancelledError:
+                pass
+        # 关闭 MQ 生产者
+        if self.mq_producer:
+            await self.mq_producer.close()
+
         if self.loop:
             self.loop.stop()
             # 关闭 PG 连接池

@@ -177,6 +177,10 @@ class AgentLoop:
         self.chat_memory = ChatMemory(workspace=workspace)
         self.dream = self.chat_memory.dream
 
+        # MQ Producer（由 Orchestrator 注入）
+        # 用于将非关键路径任务（Dream/Consolidation）投递到 RabbitMQ
+        self.mq_producer = None
+
         # 运行状态
         self._running = False
         self._active_tasks: dict[str, list[asyncio.Task]] = {}
@@ -661,24 +665,35 @@ class AgentLoop:
         if self.redis_cache:
             await self.redis_cache.invalidate_llm_cache(msg.session_key)
 
-        # 触发记忆 consolidation
-        await self.memory_consolidator.maybe_consolidate(session)
+        # ── 后台任务（异步执行，不阻塞用户响应）──
+        if self.mq_producer:
+            # MQ 模式：通过 RabbitMQ 异步投递
+            # 消费者 Worker 在后台处理 Dream 归档 + 记忆 Consolidation
+            await asyncio.gather(
+                self.mq_producer.publish("dream", {}),
+                self.mq_producer.publish("consolidation", {"session_key": msg.session_key}),
+                return_exceptions=True,
+            )
+        else:
+            # 降级模式：没有 MQ 时原地同步执行（原逻辑）
+            # 触发记忆 consolidation
+            await self.memory_consolidator.maybe_consolidate(session)
 
-        # 截断已 consolidated 的消息（仅清内存，不写存储）
-        # 数据已在 consolidation 前的 asave() 中持久化到 PG + JSONL + history.jsonl，
-        # 不再调用 asave() 避免用空 messages 覆盖 JSONL 文件。
-        if session.last_consolidated > 0:
-            session.messages[:session.last_consolidated] = []
-            session.last_consolidated = 0
+            # 截断已 consolidated 的消息（仅清内存，不写存储）
+            # 数据已在 consolidation 前的 asave() 中持久化到 PG + JSONL + history.jsonl，
+            # 不再调用 asave() 避免用空 messages 覆盖 JSONL 文件。
+            if session.last_consolidated > 0:
+                session.messages[:session.last_consolidated] = []
+                session.last_consolidated = 0
 
-        # 触发 Dream 归档（积攒至少 3 条未处理的 consolidation 时执行）
-        try:
-            if self.dream.pending_count() >= 3:
-                dream_result = self.chat_memory.run_dream()
-                if dream_result.get('added', 0) > 0 or dream_result.get('replaced', 0) > 0:
-                    logger.info(f"[Dream] 归档完成: {dream_result}")
-        except Exception as exc:
-            logger.warning(f"[Dream] 归档失败: {exc}")
+            # 触发 Dream 归档（积攒至少 3 条未处理的 consolidation 时执行）
+            try:
+                if self.dream.pending_count() >= 3:
+                    dream_result = self.chat_memory.run_dream()
+                    if dream_result.get('added', 0) > 0 or dream_result.get('replaced', 0) > 0:
+                        logger.info(f"[Dream] 归档完成: {dream_result}")
+            except Exception as exc:
+                logger.warning(f"[Dream] 归档失败: {exc}")
 
         preview_rsp = final_content[:120] + "..." if len(final_content) > 120 else final_content
         logger.info(f"[Agent] 回复 {msg.channel}:{msg.sender_id}: {preview_rsp}")
